@@ -188,13 +188,31 @@ async def hapus_dokumen(filename: str):
 # ==========================================
 # ENDPOINT 2: TANYA JAWAB (CHAT)
 # ==========================================
+from typing import List, Optional
+
 class Pertanyaan(BaseModel):
     teks: str
+    selected_files: Optional[List[str]] = []
 
 @app.post("/api/chat")
 async def chat_ai(pertanyaan: Pertanyaan):
     try:
-        dokumen_relevan = retriever.invoke(pertanyaan.teks)
+        filter_dict = None
+        if pertanyaan.selected_files:
+            if len(pertanyaan.selected_files) == 1:
+                filter_dict = {"source": pertanyaan.selected_files[0]}
+            else:
+                filter_dict = {"source": {"$in": pertanyaan.selected_files}}
+                
+        if filter_dict:
+            dokumen_relevan = vektor_db.similarity_search(
+                query=pertanyaan.teks, 
+                k=10, 
+                filter=filter_dict
+            )
+        else:
+            dokumen_relevan = retriever.invoke(pertanyaan.teks)
+        
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )
@@ -287,7 +305,22 @@ async def preview_file(filename: str):
 @app.post("/api/chat/stream")
 async def chat_ai_stream(pertanyaan: Pertanyaan):
     try:
-        dokumen_relevan = retriever.invoke(pertanyaan.teks)
+        filter_dict = None
+        if pertanyaan.selected_files:
+            if len(pertanyaan.selected_files) == 1:
+                filter_dict = {"source": pertanyaan.selected_files[0]}
+            else:
+                filter_dict = {"source": {"$in": pertanyaan.selected_files}}
+                
+        if filter_dict:
+            dokumen_relevan = vektor_db.similarity_search(
+                query=pertanyaan.teks, 
+                k=10, 
+                filter=filter_dict
+            )
+        else:
+            dokumen_relevan = retriever.invoke(pertanyaan.teks)
+        
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )

@@ -36,6 +36,7 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [fileInputKey, setFileInputKey] = useState(0);
   const [daftarFile, setDaftarFile] = useState<string[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
   const [notif, setNotif] = useState<{ type: "sukses" | "gagal"; pesan: string } | null>(null);
   const [preview, setPreview] = useState<{ file: string; page: number } | null>(null);
 
@@ -166,7 +167,7 @@ export default function Home() {
       const res = await fetch(`${API}/api/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ teks: pesanUser.content }),
+        body: JSON.stringify({ teks: pesanUser.content, selected_files: selectedFiles }),
       });
 
       const reader = res.body?.getReader();
@@ -371,7 +372,7 @@ export default function Home() {
       {/* SIDEBAR */}
       <div className="hidden md:flex flex-col w-[280px] bg-[var(--color-surface-sidebar)] border-r border-[var(--color-hairline)] shrink-0 shadow-[1px_0_5px_rgba(0,0,0,0.01)]">
         <div className="flex items-center px-5 h-16 border-b border-[var(--color-hairline-soft)] justify-between">
-          <h2 className="text-[20px] font-bold text-[var(--color-ink)]">
+          <h2 className="text-[18px] font-bold text-[var(--color-ink)]">
             Dokumen <span className="text-[var(--color-primary)]">Pengetahuan</span>
           </h2>
           <ThemeToggle />
@@ -431,6 +432,15 @@ export default function Home() {
                         key={idx}
                         className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-[var(--color-canvas)]/50 border border-[var(--color-hairline-soft)] text-[13px] font-medium text-[var(--color-body)] group hover:border-[var(--color-primary)] transition-all"
                       >
+                        <input
+                          type="checkbox"
+                          checked={selectedFiles.includes(namaFile)}
+                          onChange={(e) => {
+                            if (e.target.checked) setSelectedFiles([...selectedFiles, namaFile]);
+                            else setSelectedFiles(selectedFiles.filter((f) => f !== namaFile));
+                          }}
+                          className="accent-[var(--color-primary)]"
+                        />
                         <FileText
                           size={16}
                           className={`shrink-0 ${dotColor}`}
