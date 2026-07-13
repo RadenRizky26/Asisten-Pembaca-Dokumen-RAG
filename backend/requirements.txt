@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+langchain
+langchain-google-genai
+langchain-huggingface
+langchain-community
+chromadb
+pypdf
+python-docx
+python-pptx
+openpyxl
+pydantic
+python-dotenv
+httpx
