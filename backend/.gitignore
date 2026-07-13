@@ -1,0 +1,23 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Python virtual environment
+env/
+venv/
+.venv/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database
+database/
+*.db
+*.sqlite3
+
+# OS specific
+.DS_Store
+Thumbs.db
