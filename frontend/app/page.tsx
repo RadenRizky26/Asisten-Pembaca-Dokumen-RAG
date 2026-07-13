@@ -4,8 +4,10 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import TypingText from "@/components/TypingText";
 import ThemeToggle from "@/components/ThemeToggle";
+import PDFPreview from "@/components/PDFPreview";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
 import "katex/dist/katex.min.css"; 
 import {
@@ -35,6 +37,7 @@ export default function Home() {
   const [fileInputKey, setFileInputKey] = useState(0);
   const [daftarFile, setDaftarFile] = useState<string[]>([]);
   const [notif, setNotif] = useState<{ type: "sukses" | "gagal"; pesan: string } | null>(null);
+  const [preview, setPreview] = useState<{ file: string; page: number } | null>(null);
 
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
@@ -237,6 +240,7 @@ export default function Home() {
   const uploadFile = async () => {
     if (!file) return setNotif({ type: "gagal", pesan: "Pilih file dulu!" });
 
+    setLoading(true);
     const formData = new FormData();
     formData.append("file", file);
 
@@ -256,6 +260,8 @@ export default function Home() {
       }
     } catch {
       setNotif({ type: "gagal", pesan: "Gagal mengupload dokumen. Pastikan backend berjalan." });
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -278,15 +284,21 @@ export default function Home() {
   const formatJawabanAI = (teks: string | undefined | null) => {
     if (!teks) return null;
 
-    const processedText = teks.replace(/\[Sumber:\s*(.*?)\]/g, (match, p1) => {
-      return ` [${p1.trim()}](cite:${p1.trim()}) `;
+    // Menangkap (Sumber: NamaFile, halaman 1-2) atau (Sumber: NamaFile, hal 1, 4)
+    const processedText = teks.replace(/\(Sumber:\s*(.*?),\s*(?:halaman|hal)\s*([^)]+)\)/gi, (match, p1, p2) => {
+      // Ambil angka pertama dari string "1-2" atau "1, 4"
+      const firstPageMatch = p2.match(/\d+/);
+      const pageNum = firstPageMatch ? firstPageMatch[0] : "1";
+      // Bersihkan bintang/formatting markdown yang bocor
+      const cleanFileName = p1.replace(/\*/g, '').trim();
+      return ` <cite-btn file="${cleanFileName}" page="${pageNum}"></cite-btn> `;
     });
 
     return (
       <div className="text-[15px] leading-[1.7] text-[var(--color-body)] markdown-container">
         <ReactMarkdown
           remarkPlugins={[remarkMath, remarkGfm]}
-          rehypePlugins={[rehypeKatex]}
+          rehypePlugins={[rehypeRaw, rehypeKatex]}
           components={{
             p: ({ node, ...props }) => <p className="mb-4 last:mb-0" {...props} />,
             strong: ({ node, ...props }) => <strong className="font-bold text-[var(--color-ink)]" {...props} />,
@@ -296,24 +308,36 @@ export default function Home() {
             code: ({ node, ...props }) => (
               <code className="text-[13px] bg-slate-100 text-pink-600 px-1.5 py-0.5 rounded-md font-mono border border-slate-200" {...props} />
             ),
-            a: ({ node, href, children, ...props }) => {
-              if (href?.startsWith("cite:")) {
-                const namaFile = href.replace("cite:", "");
-                const ekstensi = namaFile.split(".").pop()?.toLowerCase() || "";
-
-                let stylePill = "bg-gray-100 text-gray-700 border border-gray-200";
-                if (ekstensi === "pdf") stylePill = "bg-[#fee2e2] text-[#991b1b] border border-[#fca5a5]";
-                else if (ekstensi === "docx") stylePill = "bg-[#e0f2fe] text-[#075985] border border-[#bae6fd]";
-                else if (ekstensi === "xlsx") stylePill = "bg-[#dcfce7] text-[#166534] border border-[#86efac]";
-                else if (ekstensi === "pptx") stylePill = "bg-[#ffedd5] text-[#9a3412] border border-[#fdba74]";
-
-                return (
-                  <span className={`inline-block px-2 py-0.5 mx-1 mb-0.5 rounded-md text-[11px] font-bold font-sans tracking-wide align-middle cursor-default shadow-sm ${stylePill}`}>
-                    {namaFile}
-                  </span>
+            // Custom tag handling for cite-btn
+            "cite-btn": ({ node, file, page, ...props }: any) => {
+              if (file && page) {
+                 return (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      setPreview({ file: file, page: parseInt(page) });
+                    }}
+                    className="inline-block px-2 py-0.5 mx-1 mb-0.5 rounded-md text-[11px] font-bold font-sans tracking-wide align-middle bg-[var(--color-primary)] text-white border border-[var(--color-primary)]/20 shadow-sm cursor-pointer transition-colors"
+                  >
+                    {file} (hal {page})
+                  </button>
                 );
               }
-              return <a href={href} className="text-blue-600 underline hover:text-blue-800" {...props}>{children}</a>;
+              return null;
+            },
+            a: ({ node, href, children, ...props }) => {
+              return (
+                <a 
+                  href={href} 
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 underline hover:text-blue-800" 
+                  {...props}
+                >
+                  {children}
+                </a>
+              );
             },
           }}
         >
@@ -325,6 +349,7 @@ export default function Home() {
 
   return (
     <div className="flex h-screen w-full bg-[var(--color-canvas)] overflow-hidden">
+      {preview && <PDFPreview filename={preview.file} pageNumber={preview.page} onClose={() => setPreview(null)} />}
 
       {/* NOTIFIKASI TOAST */}
       {notif && (
@@ -346,7 +371,7 @@ export default function Home() {
       {/* SIDEBAR */}
       <div className="hidden md:flex flex-col w-[280px] bg-[var(--color-surface-sidebar)] border-r border-[var(--color-hairline)] shrink-0 shadow-[1px_0_5px_rgba(0,0,0,0.01)]">
         <div className="flex items-center px-5 h-16 border-b border-[var(--color-hairline-soft)] justify-between">
-          <h2 className="text-[18px] font-bold text-[var(--color-ink)]">
+          <h2 className="text-[20px] font-bold text-[var(--color-ink)]">
             Dokumen <span className="text-[var(--color-primary)]">Pengetahuan</span>
           </h2>
           <ThemeToggle />
@@ -370,9 +395,10 @@ export default function Home() {
             </div>
             <button
               onClick={uploadFile}
-              className="w-full bg-[var(--color-primary)] text-white text-[14px] font-semibold py-2 px-3 rounded-md hover:bg-[var(--color-primary-active)] transition shadow-sm"
+              disabled={loading}
+              className="w-full bg-[var(--color-primary)] text-white text-[14px] font-semibold py-2 px-3 rounded-md hover:bg-[var(--color-primary-active)] transition shadow-sm disabled:opacity-50"
             >
-              Proses Dokumen
+              {loading ? "Memproses..." : "Proses Dokumen"}
             </button>
           </div>
 

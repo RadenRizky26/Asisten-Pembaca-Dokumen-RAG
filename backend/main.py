@@ -2,8 +2,12 @@ import os
 import shutil
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
+import comtypes.client
+import pythoncom
 
 # Pustaka AI LangChain
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -15,6 +19,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Pustaka Ekstraksi Dokumen
 from pypdf import PdfReader
+from pdf2image import convert_from_path
+import pytesseract
 import docx
 from pptx import Presentation
 import openpyxl
@@ -79,35 +85,71 @@ async def upload_dokumen(file: UploadFile = File(...)):
     ekstensi = filename.lower().split('.')[-1]
     teks_dokumen = ""
     
-    # Ekstraksi Teks
+    # Ekstraksi Teks dan Chunking langsung per halaman
     try:
+        potongan_global = []
+        metadatas_global = []
+        pemotong = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+
         if ekstensi == "pdf":
             reader = PdfReader(file_path)
-            for hal in reader.pages:
+            for i, hal in enumerate(reader.pages):
+                page_num = i + 1
                 t = hal.extract_text()
-                if t: teks_dokumen += t
+                
+                # Fallback OCR jika teks kosong di halaman ini
+                if not t or not t.strip():
+                    try:
+                        # Convert specific page (pdf2image uses 1-based indexing for first_page)
+                        images = convert_from_path(file_path, first_page=page_num, last_page=page_num)
+                        if images:
+                            t = pytesseract.image_to_string(images[0])
+                    except Exception as e:
+                        print(f"OCR gagal pada halaman {page_num}: {e}")
+                        t = ""
+
+                if t and t.strip():
+                    chunks = pemotong.split_text(t)
+                    potongan_global.extend(chunks)
+                    metadatas_global.extend([{"source": filename, "page": page_num}] * len(chunks))
+
         elif ekstensi == "docx":
             doc = docx.Document(file_path)
             teks_dokumen = "\n".join([p.text for p in doc.paragraphs])
+            if teks_dokumen.strip():
+                chunks = pemotong.split_text(teks_dokumen)
+                potongan_global.extend(chunks)
+                metadatas_global.extend([{"source": filename, "page": 1}] * len(chunks))
+
         elif ekstensi == "pptx":
             prs = Presentation(file_path)
-            for slide in prs.slides:
+            for i, slide in enumerate(prs.slides):
+                slide_num = i + 1
+                teks_slide = ""
                 for shape in slide.shapes:
                     if hasattr(shape, "text") and shape.text.strip():
-                        teks_dokumen += shape.text + "\n"
+                        teks_slide += shape.text + "\n"
+                if teks_slide.strip():
+                    chunks = pemotong.split_text(teks_slide)
+                    potongan_global.extend(chunks)
+                    metadatas_global.extend([{"source": filename, "page": slide_num}] * len(chunks))
+
         elif ekstensi == "xlsx":
             wb = openpyxl.load_workbook(file_path, data_only=True)
-            for sheet_name in wb.sheetnames:
+            for sheet_idx, sheet_name in enumerate(wb.sheetnames):
                 sheet = wb[sheet_name]
+                teks_sheet = ""
                 for baris in sheet.iter_rows(values_only=True):
                     teks_baris = ", ".join([str(sel) for sel in baris if sel is not None])
-                    if teks_baris.strip(): teks_dokumen += teks_baris + "\n"
+                    if teks_baris.strip(): teks_sheet += teks_baris + "\n"
+                
+                if teks_sheet.strip():
+                    chunks = pemotong.split_text(teks_sheet)
+                    potongan_global.extend(chunks)
+                    metadatas_global.extend([{"source": filename, "page": sheet_idx + 1}] * len(chunks))
         
-        if teks_dokumen.strip():
-            pemotong = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=400)
-            potongan = pemotong.split_text(teks_dokumen)
-            metadatas = [{"source": filename}] * len(potongan)
-            vektor_db.add_texts(texts=potongan, metadatas=metadatas)
+        if potongan_global:
+            vektor_db.add_texts(texts=potongan_global, metadatas=metadatas_global)
             return {"status": "sukses", "pesan": f"{filename} berhasil diindeks!"}
         else:
             raise HTTPException(status_code=400, detail="Dokumen kosong atau tidak terbaca.")
@@ -123,7 +165,9 @@ async def lihat_daftar_dokumen():
     try:
         if not os.path.exists("./kumpulan_dokumen"):
             return {"files": []}
-        daftar_file = os.listdir("./kumpulan_dokumen")
+        
+        # Ambil file di folder kumpulan_dokumen, kecualikan folder 'preview'
+        daftar_file = [f for f in os.listdir("./kumpulan_dokumen") if os.path.isfile(os.path.join("./kumpulan_dokumen", f))]
         return {"files": daftar_file}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -135,7 +179,8 @@ async def hapus_dokumen(filename: str):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
     try:
         os.remove(file_path)
-        # Hapus juga dari vector db (opsional: implementasi lebih kompleks)
+        # Hapus data dari vector db berdasarkan metadata source
+        vektor_db.delete(where={"source": filename})
         return {"status": "sukses", "pesan": f"{filename} dihapus!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -151,7 +196,7 @@ async def chat_ai(pertanyaan: Pertanyaan):
     try:
         dokumen_relevan = retriever.invoke(pertanyaan.teks)
         konteks_dengan_sumber = "\n\n---\n\n".join(
-            [f"[Sumber: {doc.metadata.get('source', 'Unknown')}]\n{doc.page_content}" for doc in dokumen_relevan]
+            [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )
         
         chain = prompt | llm | StrOutputParser()
@@ -161,14 +206,90 @@ async def chat_ai(pertanyaan: Pertanyaan):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+
+# ==========================================
+# ENDPOINT: DOWNLOAD FILE
+# ==========================================
+@app.get("/api/files/download/{filename}")
+async def download_file(filename: str):
+    import urllib.parse
+    filename = urllib.parse.unquote(filename)
+    file_path = os.path.join("./kumpulan_dokumen", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File tidak ditemukan.")
+    return FileResponse(file_path)
+
+@app.get("/api/files/preview/{filename}")
+
+async def preview_file(filename: str):
+    # Mengatasi encoded URL (e.g. Analisis%20TRAM.pptx)
+    import urllib.parse
+    filename = urllib.parse.unquote(filename)
+    
+    file_path = os.path.abspath(os.path.join("./kumpulan_dokumen", filename))
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File tidak ditemukan.")
+        
+    ekstensi = filename.lower().split('.')[-1]
+    
+    if ekstensi == "pdf":
+        return FileResponse(file_path)
+        
+    # Buat folder preview jika belum ada
+    preview_dir = os.path.abspath("./kumpulan_dokumen/preview")
+    if not os.path.exists(preview_dir):
+        os.makedirs(preview_dir)
+        
+    pdf_filename = f"{filename}.pdf"
+    pdf_path = os.path.join(preview_dir, pdf_filename)
+    
+    # Jika sudah di-convert, langsung return
+    if os.path.exists(pdf_path):
+        return FileResponse(pdf_path)
+        
+    # Convert menggunakan comtypes (Butuh MS Office terinstall di Windows)
+    try:
+        pythoncom.CoInitialize()
+        if ekstensi in ["doc", "docx"]:
+            word = comtypes.client.CreateObject("Word.Application")
+            word.Visible = False
+            doc = word.Documents.Open(file_path)
+            doc.SaveAs(pdf_path, FileFormat=17) # 17 = wdFormatPDF
+            doc.Close()
+            word.Quit()
+        elif ekstensi in ["ppt", "pptx"]:
+            powerpoint = comtypes.client.CreateObject("Powerpoint.Application")
+            # PowerPoint tidak mengizinkan .Visible = False di beberapa versi, kita hapus
+            ppt = powerpoint.Presentations.Open(file_path, WithWindow=False)
+            ppt.SaveAs(pdf_path, 32) # 32 = ppSaveAsPDF
+            ppt.Close()
+            powerpoint.Quit()
+        elif ekstensi in ["xls", "xlsx"]:
+            excel = comtypes.client.CreateObject("Excel.Application")
+            excel.Visible = False
+            wb = excel.Workbooks.Open(file_path)
+            wb.ExportAsFixedFormat(0, pdf_path) # 0 = xlTypePDF
+            wb.Close(False)
+            excel.Quit()
+        else:
+            raise HTTPException(status_code=400, detail="Format tidak didukung untuk preview.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal convert ke PDF: {str(e)}")
+    finally:
+        pythoncom.CoUninitialize()
+        
+    if os.path.exists(pdf_path):
+        return FileResponse(pdf_path)
+    raise HTTPException(status_code=500, detail="File PDF tidak terbentuk.")
+
 
 @app.post("/api/chat/stream")
 async def chat_ai_stream(pertanyaan: Pertanyaan):
     try:
         dokumen_relevan = retriever.invoke(pertanyaan.teks)
         konteks_dengan_sumber = "\n\n---\n\n".join(
-            [f"[Sumber: {doc.metadata.get('source', 'Unknown')}]\n{doc.page_content}" for doc in dokumen_relevan]
+            [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )
         
         chain = prompt | llm | StrOutputParser()
