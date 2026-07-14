@@ -14,7 +14,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="id" suppressHydrationWarning>
-      <body className={`font-sans bg-canvas text-ink antialiased`}  suppressHydrationWarning>
+      <body className={`font-sans bg-canvas text-ink antialiased`}>
         <Providers>
           {children}
         </Providers>
@@ -22,3 +22,4 @@ export default function RootLayout({
     </html>
   );
 }
+

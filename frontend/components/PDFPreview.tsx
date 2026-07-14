@@ -90,10 +90,10 @@ export default function PDFPreview({ filename, pageNumber, onClose }: PDFPreview
         <div className="flex justify-between items-center">
           <h3 className="font-bold text-[15px] text-[var(--color-ink)] truncate max-w-[70%]">{filename}</h3>
           <div className="flex items-center gap-2">
-            <a href={downloadUrl} className="text-[13px] font-medium text-blue-500 hover:text-blue-700 bg-blue-50 px-2 py-1 rounded flex items-center gap-1" download>
-              <DownloadSimple weight="bold" /> Unduh
+            <a href={downloadUrl} className="text-[13px] font-semibold text-white bg-[var(--color-primary)] hover:bg-[var(--color-primary-active)] px-3 py-1.5 rounded-md flex items-center gap-1 shadow-sm transition-colors" download>
+              <DownloadSimple weight="bold" size={14} /> Unduh
             </a>
-            <button onClick={onClose} className="text-[var(--color-muted)] hover:text-red-500 hover:bg-red-50 p-1.5 rounded transition">
+            <button onClick={onClose} className="text-[var(--color-muted)] hover:text-[var(--color-primary)] hover:bg-[var(--color-hairline-soft)] p-1.5 rounded transition">
               <X size={18} weight="bold" />
             </button>
           </div>

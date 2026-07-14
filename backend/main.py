@@ -16,11 +16,10 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
 # Pustaka Ekstraksi Dokumen
 from pypdf import PdfReader
-from pdf2image import convert_from_path
-import pytesseract
 import docx
 from pptx import Presentation
 import openpyxl
@@ -49,14 +48,15 @@ llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=
 
 template_instruksi = """
     Kamu adalah asisten AI yang cerdas, ramah, dan interaktif.
-    Konteks dokumen di bawah ini telah dilengkapi dengan tag [Sumber: Nama File].
+    Konteks dokumen di bawah ini telah dilengkapi dengan penanda halaman seperti --- Halaman 1 ---.
 
     Aturan menjawab:
     1. Berikan jawaban yang SANGAT DETAIL dan MENYELURUH.
     2. Kamu WAJIB melakukan sintesis dari SEMUA dokumen yang tersedia jika informasi tersebar. Jangan hanya terpaku pada satu dokumen saja.
-    3. Kamu WAJIB menyebutkan sumber referensi secara natural di dalam penjelasanmu. Contoh: "Menurut dokumen A... dan dokumen B..." atau cantumkan "(Sumber: A.pdf, B.docx)" di akhir poin penjelasan.
-    4. Gunakan format yang rapi (bullet points, paragraf, atau teks tebal) agar mudah dibaca.
-    5. Jika informasi TIDAK ADA di dalam konteks, katakan: "Maaf, saya belum menemukan informasi tersebut di dalam dokumen."
+    3. Cari tanda --- Halaman X --- atau --- Slide X --- dalam konteks untuk menentukan referensi halaman.
+    4. Kamu WAJIB menyebutkan sumber referensi secara natural di dalam penjelasanmu. Contoh: "Menurut dokumen A halaman 1... dan dokumen B slide 2..." atau cantumkan "(Sumber: A.pdf, halaman 1)" di akhir poin penjelasan.
+    5. Gunakan format yang rapi (bullet points, paragraf, atau teks tebal) agar mudah dibaca.
+    6. Jika informasi TIDAK ADA di dalam konteks, katakan: "Maaf, saya belum menemukan informasi tersebut di dalam dokumen."
 
     Konteks Dokumen:
     {context}
@@ -83,73 +83,76 @@ async def upload_dokumen(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
         
     ekstensi = filename.lower().split('.')[-1]
-    teks_dokumen = ""
     
-    # Ekstraksi Teks dan Chunking langsung per halaman
+    # Kumpulan dokumen terstruktur dengan metadata halaman
+    documents = []
+    
+    # Ekstraksi Teks
     try:
-        potongan_global = []
-        metadatas_global = []
-        pemotong = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-
         if ekstensi == "pdf":
             reader = PdfReader(file_path)
             for i, hal in enumerate(reader.pages):
                 page_num = i + 1
                 t = hal.extract_text()
-                
-                # Fallback OCR jika teks kosong di halaman ini
-                if not t or not t.strip():
-                    try:
-                        # Convert specific page (pdf2image uses 1-based indexing for first_page)
-                        images = convert_from_path(file_path, first_page=page_num, last_page=page_num)
-                        if images:
-                            t = pytesseract.image_to_string(images[0])
-                    except Exception as e:
-                        print(f"OCR gagal pada halaman {page_num}: {e}")
-                        t = ""
-
-                if t and t.strip():
-                    chunks = pemotong.split_text(t)
-                    potongan_global.extend(chunks)
-                    metadatas_global.extend([{"source": filename, "page": page_num}] * len(chunks))
-
+                if t:
+                    page_text = f"\n--- Halaman {page_num} ---\n{t}"
+                    documents.append(Document(
+                        page_content=page_text, 
+                        metadata={"source": filename, "page": page_num}
+                    ))
         elif ekstensi == "docx":
             doc = docx.Document(file_path)
             teks_dokumen = "\n".join([p.text for p in doc.paragraphs])
             if teks_dokumen.strip():
-                chunks = pemotong.split_text(teks_dokumen)
-                potongan_global.extend(chunks)
-                metadatas_global.extend([{"source": filename, "page": 1}] * len(chunks))
-
+                documents.append(Document(
+                    page_content=teks_dokumen, 
+                    metadata={"source": filename}
+                ))
         elif ekstensi == "pptx":
             prs = Presentation(file_path)
             for i, slide in enumerate(prs.slides):
                 slide_num = i + 1
-                teks_slide = ""
+                slide_text = f"\n--- Slide {slide_num} ---\n"
+                has_text = False
                 for shape in slide.shapes:
                     if hasattr(shape, "text") and shape.text.strip():
-                        teks_slide += shape.text + "\n"
-                if teks_slide.strip():
-                    chunks = pemotong.split_text(teks_slide)
-                    potongan_global.extend(chunks)
-                    metadatas_global.extend([{"source": filename, "page": slide_num}] * len(chunks))
-
+                        slide_text += shape.text + "\n"
+                        has_text = True
+                if has_text:
+                    documents.append(Document(
+                        page_content=slide_text, 
+                        metadata={"source": filename, "page": slide_num}
+                    ))
         elif ekstensi == "xlsx":
             wb = openpyxl.load_workbook(file_path, data_only=True)
-            for sheet_idx, sheet_name in enumerate(wb.sheetnames):
+            teks_dokumen = ""
+            for sheet_name in wb.sheetnames:
                 sheet = wb[sheet_name]
-                teks_sheet = ""
+                teks_dokumen += f"\n--- Sheet {sheet_name} ---\n"
                 for baris in sheet.iter_rows(values_only=True):
                     teks_baris = ", ".join([str(sel) for sel in baris if sel is not None])
-                    if teks_baris.strip(): teks_sheet += teks_baris + "\n"
-                
-                if teks_sheet.strip():
-                    chunks = pemotong.split_text(teks_sheet)
-                    potongan_global.extend(chunks)
-                    metadatas_global.extend([{"source": filename, "page": sheet_idx + 1}] * len(chunks))
+                    if teks_baris.strip(): 
+                        teks_dokumen += teks_baris + "\n"
+            if teks_dokumen.strip():
+                documents.append(Document(
+                    page_content=teks_dokumen, 
+                    metadata={"source": filename}
+                ))
         
-        if potongan_global:
-            vektor_db.add_texts(texts=potongan_global, metadatas=metadatas_global)
+        if documents:
+            pemotong = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=400)
+            potongan = pemotong.split_documents(documents)
+            
+            # Pastikan setiap potongan memiliki marker halaman (berguna jika teks sangat panjang dan terpecah)
+            for chunk in potongan:
+                page = chunk.metadata.get("page")
+                if page is not None:
+                    if "--- Halaman" not in chunk.page_content and "--- Slide" not in chunk.page_content:
+                        # Tambahkan marker sesuai ekstensi (fallback ke Halaman)
+                        tipe = "Slide" if ekstensi == "pptx" else "Halaman"
+                        chunk.page_content = f"\n--- {tipe} {page} ---\n{chunk.page_content}"
+                        
+            vektor_db.add_documents(potongan)
             return {"status": "sukses", "pesan": f"{filename} berhasil diindeks!"}
         else:
             raise HTTPException(status_code=400, detail="Dokumen kosong atau tidak terbaca.")
@@ -190,6 +193,13 @@ async def hapus_dokumen(filename: str):
 # ==========================================
 class Pertanyaan(BaseModel):
     teks: str
+<<<<<<< Updated upstream
+=======
+    selected_files: Optional[List[str]] = []
+    history: Optional[List[dict]] = []
+    temperature: Optional[float] = 0.5
+    k: Optional[int] = 10
+>>>>>>> Stashed changes
 
 @app.post("/api/chat")
 async def chat_ai(pertanyaan: Pertanyaan):
@@ -287,15 +297,48 @@ async def preview_file(filename: str):
 @app.post("/api/chat/stream")
 async def chat_ai_stream(pertanyaan: Pertanyaan):
     try:
+<<<<<<< Updated upstream
         dokumen_relevan = retriever.invoke(pertanyaan.teks)
+=======
+        # Gunakan parameter dari frontend jika ada
+        temp = pertanyaan.temperature or 0.5
+        k_val = pertanyaan.k or 10
+        
+        # Re-inisialisasi LLM dengan temp baru
+        current_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=temp)
+
+        filter_dict = None
+        if pertanyaan.selected_files:
+            if len(pertanyaan.selected_files) == 1:
+                filter_dict = {"source": pertanyaan.selected_files[0]}
+            else:
+                filter_dict = {"source": {"$in": pertanyaan.selected_files}}
+                
+        if filter_dict:
+            dokumen_relevan = vektor_db.similarity_search(
+                query=pertanyaan.teks, 
+                k=k_val, 
+                filter=filter_dict
+            )
+        else:
+            # Re-init retriever untuk k yang dinamis
+            retriever_dynamic = vektor_db.as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
+            dokumen_relevan = retriever_dynamic.invoke(pertanyaan.teks)
+        
+>>>>>>> Stashed changes
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )
         
-        chain = prompt | llm | StrOutputParser()
+        # Format history untuk prompt
+        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in pertanyaan.history[-6:]]) if pertanyaan.history else ""
+        
+        full_context = f"History:\n{history_text}\n\nKonteks Dokumen:\n{konteks_dengan_sumber}"
+        
+        chain = prompt | current_llm | StrOutputParser()
         
         async def generate():
-            async for chunk in chain.astream({"context": konteks_dengan_sumber, "question": pertanyaan.teks}):
+            async for chunk in chain.astream({"context": full_context, "question": pertanyaan.teks}):
                 if chunk:
                     yield f"data: {json.dumps({'token': chunk})}\n\n"
             yield "data: [DONE]\n\n"

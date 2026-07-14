@@ -2,25 +2,17 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
-import TypingText from "@/components/TypingText";
+import { useTheme } from "next-themes";
 import ThemeToggle from "@/components/ThemeToggle";
 import PDFPreview from "@/components/PDFPreview";
+import TypingText from "@/components/TypingText";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
 import "katex/dist/katex.min.css"; 
-import {
-  Plus,
-  Trash,
-  User,
-  Sparkle,
-  ChatText,
-  ArrowUp,
-  FileText,
-  Sun,
-  Moon,
-} from "@phosphor-icons/react";
+import { Toaster, toast } from "sonner";
+import { Gear, Plus, Trash, User, Sparkle, ChatText, ArrowUp, FileText, Sun, Moon, DownloadSimple, X, Info } from "@phosphor-icons/react";
 
 interface ChatSession {
   id: string;
@@ -36,12 +28,26 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [fileInputKey, setFileInputKey] = useState(0);
   const [daftarFile, setDaftarFile] = useState<string[]>([]);
+<<<<<<< Updated upstream
   const [notif, setNotif] = useState<{ type: "sukses" | "gagal"; pesan: string } | null>(null);
+=======
+  const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
+>>>>>>> Stashed changes
   const [preview, setPreview] = useState<{ file: string; page: number } | null>(null);
 
+  const [abortController, setAbortController] = useState<AbortController | null>(null);
+  const [temperature, setTemperature] = useState(0.5);
+  const [k, setK] = useState(10);
+  const [model, setModel] = useState("gemini-3.1-flash-lite-preview");
+  const [showSettings, setShowSettings] = useState(false);
+  const [showTutorial, setShowTutorial] = useState(false);
+  const [showCitations, setShowCitations] = useState(true);
+  const [showDocFilter, setShowDocFilter] = useState(true);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
 
+  const { theme } = useTheme();
   const pesanAkhirRef = useRef<HTMLDivElement>(null);
   
   useEffect(() => {
@@ -71,13 +77,6 @@ export default function Home() {
     fetchFiles();
     fetchSessions();
   }, []);
-
-  useEffect(() => {
-    if (notif) {
-      const t = setTimeout(() => setNotif(null), 3500);
-      return () => clearTimeout(t);
-    }
-  }, [notif]);
 
   const createNewChat = useCallback(async () => {
     try {
@@ -135,39 +134,40 @@ export default function Home() {
   const kirimPesan = async () => {
     if (!pertanyaan.trim()) return;
 
-    let sessionId = activeChatId;
-    if (!sessionId) {
-      try {
-        const res = await fetch(`${API}/api/chat/sessions`, { method: "POST" });
-        if (res.ok) {
-          const session = await res.json();
-          sessionId = session.id;
-          setChatSessions((prev) => [session, ...prev]);
-          setActiveChatId(session.id);
-        }
-      } catch {}
-    }
+    const controller = new AbortController();
+    setAbortController(controller);
 
-    const pesanUser = { role: "user", content: pertanyaan };
+    const pesanUser: { role: string; content: string } = {
+      role: "user",
+      content: pertanyaan,
+    };
     const chatBaru = [...chat, pesanUser];
     setChat(chatBaru);
     setPertanyaan("");
     setLoading(true);
-    setStreamingText("");
 
-    const title =
-      chat.length === 0
-        ? pertanyaan.length > 40
-          ? pertanyaan.slice(0, 40) + "…"
-          : pertanyaan
-        : null;
+    const sessionId = activeChatId;
+    const title = chat.length === 0 ? pertanyaan.slice(0, 50) : undefined;
 
     try {
       const res = await fetch(`${API}/api/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+<<<<<<< Updated upstream
         body: JSON.stringify({ teks: pesanUser.content }),
+=======
+        body: JSON.stringify({ 
+          teks: pesanUser.content, 
+          selected_files: showDocFilter ? selectedFiles : [],
+          history: chat,
+          temperature,
+          k 
+        }),
+        signal: controller.signal
+>>>>>>> Stashed changes
       });
+
+      if (!res.ok) throw new Error("Server error");
 
       const reader = res.body?.getReader();
       if (!reader) return;
@@ -216,7 +216,8 @@ export default function Home() {
           )
         );
       }
-    } catch {
+    } catch (e: any) {
+      if (e.name === "AbortError") return;
       const pesanAI = {
         role: "ai",
         content: "Maaf, terjadi kesalahan koneksi ke server. Pastikan backend sudah berjalan.",
@@ -234,65 +235,108 @@ export default function Home() {
       }
     } finally {
       setLoading(false);
+      setAbortController(null);
     }
   };
 
   const uploadFile = async () => {
-    if (!file) return setNotif({ type: "gagal", pesan: "Pilih file dulu!" });
+    if (!file) return toast.error("Pilih file dulu!");
 
-    setLoading(true);
-    const formData = new FormData();
-    formData.append("file", file);
+    const uploadPromise = new Promise(async (resolve, reject) => {
+      const formData = new FormData();
+      formData.append("file", file);
 
-    try {
-      const res = await fetch(`${API}/api/upload`, {
-        method: "POST",
-        body: formData,
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setNotif({ type: "gagal", pesan: data.detail || "Terjadi kesalahan saat upload." });
-      } else {
-        setFile(null);
-        setFileInputKey((k) => k + 1);
-        fetchFiles();
-        setNotif({ type: "sukses", pesan: `Dokumen "${file.name}" berhasil ditambahkan!` });
+      try {
+        const res = await fetch(`${API}/api/upload`, {
+          method: "POST",
+          body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          reject(data.detail || "Terjadi kesalahan saat upload.");
+        } else {
+          setFile(null);
+          setFileInputKey((k) => k + 1);
+          fetchFiles();
+          resolve(`Dokumen "${file.name}" berhasil ditambahkan!`);
+        }
+      } catch {
+        reject("Gagal mengupload dokumen. Pastikan backend berjalan.");
       }
-    } catch {
-      setNotif({ type: "gagal", pesan: "Gagal mengupload dokumen. Pastikan backend berjalan." });
-    } finally {
-      setLoading(false);
-    }
+    });
+
+    toast.promise(uploadPromise, {
+      loading: "Memproses dokumen...",
+      success: (data) => data as string,
+      error: (err) => err,
+    });
   };
 
-  const deleteFile = async (namaFile: string) => {
-    if (!confirm(`Hapus dokumen "${namaFile}"?`)) return;
+  const deleteFile = (namaFile: string) => setConfirmDelete(namaFile);
 
+  const executeDelete = async (namaFile: string) => {
+    setConfirmDelete(null);
     try {
       const res = await fetch(`${API}/api/files/${namaFile}`, { method: "DELETE" });
       if (res.ok) {
         fetchFiles();
-        setNotif({ type: "sukses", pesan: `${namaFile} berhasil dihapus!` });
+        toast.success(`${namaFile} berhasil dihapus!`);
       } else {
-        setNotif({ type: "gagal", pesan: "Gagal menghapus file." });
+        toast.error("Gagal menghapus file.");
       }
     } catch {
-      setNotif({ type: "gagal", pesan: "Error koneksi." });
+      toast.error("Error koneksi.");
     }
   };
 
-  const formatJawabanAI = (teks: string | undefined | null) => {
+  const exportChat = () => {
+    const chatText = chat.map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n\n");
+    const blob = new Blob([chatText], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `chat_export_${new Date().toISOString().slice(0, 10)}.txt`;
+    a.click();
+  };
+  const formatJawabanAI = (teks: string) => {
     if (!teks) return null;
 
-    // Menangkap (Sumber: NamaFile, halaman 1-2) atau (Sumber: NamaFile, hal 1, 4)
-    const processedText = teks.replace(/\(Sumber:\s*(.*?),\s*(?:halaman|hal)\s*([^)]+)\)/gi, (match, p1, p2) => {
-      // Ambil angka pertama dari string "1-2" atau "1, 4"
-      const firstPageMatch = p2.match(/\d+/);
-      const pageNum = firstPageMatch ? firstPageMatch[0] : "1";
-      // Bersihkan bintang/formatting markdown yang bocor
-      const cleanFileName = p1.replace(/\*/g, '').trim();
-      return ` <cite-btn file="${cleanFileName}" page="${pageNum}"></cite-btn> `;
-    });
+    let processedText = teks;
+
+    if (showCitations) {
+      // Fungsi untuk mencari nama file asli yang paling mendekati dari daftarFile
+      const findRealFileName = (citedName: string) => {
+        // 1. Coba kecocokan pasti (exact match)
+        if (daftarFile.includes(citedName)) return citedName;
+        if (daftarFile.includes(`${citedName}.pdf`)) return `${citedName}.pdf`;
+        
+        // 2. Bersihkan nama kutipan dari spasi ekstra atau titik-titik
+        const cleanCited = citedName.replace(/\*/g, '').trim().toLowerCase();
+        
+        // 3. Coba cari jika nama kutipan adalah bagian dari nama file asli (substring)
+        for (const file of daftarFile) {
+          if (file.toLowerCase().includes(cleanCited)) return file;
+        }
+
+        // 4. Jika masih tidak ketemu, coba pecah per kata (fuzzy match sederhana)
+        const words = cleanCited.replace(/&/g, ' ').split(/\s+/).filter(w => w.length > 2);
+        for (const file of daftarFile) {
+          const fileLower = file.toLowerCase();
+          // Jika 2 kata atau lebih dari kutipan ada di nama file, anggap itu filenya
+          const matches = words.filter(w => fileLower.includes(w));
+          if (matches.length >= Math.min(2, words.length) && words.length > 0) return file;
+        }
+
+        return cleanCited; // Fallback jika tidak ketemu
+      };
+
+      processedText = teks.replace(/\(Sumber:\s*(.*?),\s*(?:halaman|hal)\s*([^)]+)\)/gi, (match, p1, p2) => {
+        const firstPageMatch = p2.match(/\d+/);
+        const pageNum = firstPageMatch ? firstPageMatch[0] : "1";
+        const cleanFileName = findRealFileName(p1);
+        return ` <cite-btn file="${cleanFileName}" page="${pageNum}" raw-name="${p1}"></cite-btn> `;
+      });
+    }
 
     return (
       <div className="text-[15px] leading-[1.7] text-[var(--color-body)] markdown-container">
@@ -300,46 +344,42 @@ export default function Home() {
           remarkPlugins={[remarkMath, remarkGfm]}
           rehypePlugins={[rehypeRaw, rehypeKatex]}
           components={{
-            p: ({ node, ...props }) => <p className="mb-4 last:mb-0" {...props} />,
-            strong: ({ node, ...props }) => <strong className="font-bold text-[var(--color-ink)]" {...props} />,
-            ul: ({ node, ...props }) => <ul className="list-disc pl-6 my-4 space-y-2 marker:text-[var(--color-muted)] animate-in fade-in" {...props} />,
-            ol: ({ node, ...props }) => <ol className="list-decimal pl-6 my-4 space-y-2 marker:text-[var(--color-muted)] animate-in fade-in" {...props} />,
-            li: ({ node, ...props }) => <li className="pl-1" {...props} />,
-            code: ({ node, ...props }) => (
+            p: (props: any) => <p className="mb-4 last:mb-0" {...props} />,
+            strong: (props: any) => <strong className="font-bold text-[var(--color-ink)]" {...props} />,
+            ul: (props: any) => <ul className="list-disc pl-6 my-4 space-y-2 marker:text-[var(--color-muted)] animate-in fade-in" {...props} />,
+            ol: (props: any) => <ol className="list-decimal pl-6 my-4 space-y-2 marker:text-[var(--color-muted)] animate-in fade-in" {...props} />,
+            li: (props: any) => <li className="pl-1" {...props} />,
+            code: (props: any) => (
               <code className="text-[13px] bg-slate-100 text-pink-600 px-1.5 py-0.5 rounded-md font-mono border border-slate-200" {...props} />
             ),
-            // Custom tag handling for cite-btn
-            "cite-btn": ({ node, file, page, ...props }: any) => {
-              if (file && page) {
-                 return (
+            "cite-btn": (props: any) => {
+              if (props.file && props.page) {
+                // Tampilkan raw-name (seperti yang ditulis AI) jika ada, agar tetap sinkron tampilannya
+                const displayText = props['raw-name'] ? props['raw-name'].replace(/\*/g, '').trim() : props.file;
+                return (
                   <button
                     type="button"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      setPreview({ file: file, page: parseInt(page) });
-                    }}
+                    onClick={() => setPreview({ file: props.file, page: parseInt(props.page) })}
                     className="inline-block px-2 py-0.5 mx-1 mb-0.5 rounded-md text-[11px] font-bold font-sans tracking-wide align-middle bg-[var(--color-primary)] text-white border border-[var(--color-primary)]/20 shadow-sm cursor-pointer transition-colors"
                   >
-                    {file} (hal {page})
+                    {displayText} (hal {props.page})
                   </button>
                 );
               }
               return null;
             },
-            a: ({ node, href, children, ...props }) => {
-              return (
-                <a 
-                  href={href} 
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-blue-600 underline hover:text-blue-800" 
-                  {...props}
-                >
-                  {children}
-                </a>
-              );
-            },
-          }}
+            a: (props: any) => (
+              <a
+                href={props.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 underline hover:text-blue-800"
+                {...props}
+              >
+                {props.children}
+              </a>
+            ),
+          } as any}
         >
           {processedText}
         </ReactMarkdown>
@@ -351,30 +391,47 @@ export default function Home() {
     <div className="flex h-screen w-full bg-[var(--color-canvas)] overflow-hidden">
       {preview && <PDFPreview filename={preview.file} pageNumber={preview.page} onClose={() => setPreview(null)} />}
 
-      {/* NOTIFIKASI TOAST */}
-      {notif && (
-        <div className={`fixed top-4 right-4 z-50 flex items-center gap-3 px-4 py-3 rounded-lg shadow-lg text-body-sm font-medium transition-all animate-in slide-in-from-right ${
-          notif.type === "sukses"
-            ? "bg-green-50 text-green-800 border border-green-200"
-            : "bg-red-50 text-red-800 border border-red-200"
-        }`}>
-          <span
-            onClick={() => setNotif(null)}
-            className="ml-2 cursor-pointer hover:opacity-70 shrink-0 text-lg leading-none"
-          >
-            ×
-          </span>
-          <span className="flex-1">{notif.pesan}</span>
+        {/* NOTIFIKASI TOAST */}
+        <Toaster richColors position="top-center" theme={theme === "dark" ? "dark" : "light"} />
+
+
+      {/* MODAL KONFIRMASI HAPUS */}
+      {confirmDelete && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-gray-800 p-6 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 max-w-sm w-full mx-4 animate-in zoom-in-95 duration-200">
+            <p className="text-sm font-medium mb-4 text-gray-900 dark:text-gray-100">
+              Hapus dokumen "{confirmDelete}"?
+            </p>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setConfirmDelete(null)}
+                className="px-4 py-2 text-xs rounded-md border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+              >
+                Batal
+              </button>
+              <button
+                onClick={() => executeDelete(confirmDelete)}
+                className="px-4 py-2 text-xs rounded-md bg-red-500 text-white hover:bg-red-600 transition-colors"
+              >
+                Ya, Hapus
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
       {/* SIDEBAR */}
       <div className="hidden md:flex flex-col w-[280px] bg-[var(--color-surface-sidebar)] border-r border-[var(--color-hairline)] shrink-0 shadow-[1px_0_5px_rgba(0,0,0,0.01)]">
+<<<<<<< Updated upstream
         <div className="flex items-center px-5 h-16 border-b border-[var(--color-hairline-soft)] justify-between">
           <h2 className="text-[20px] font-bold text-[var(--color-ink)]">
+=======
+        {/* HEADER SIDEBAR (Judul Saja) */}
+        <div className="flex items-center px-5 h-16 border-b border-[var(--color-hairline-soft)]">
+          <h2 className="text-[20px] font-mono text-[var(--color-ink)]">
+>>>>>>> Stashed changes
             Dokumen <span className="text-[var(--color-primary)]">Pengetahuan</span>
           </h2>
-          <ThemeToggle />
         </div>
 
         <div className="p-5 flex flex-col gap-4">
@@ -431,6 +488,20 @@ export default function Home() {
                         key={idx}
                         className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-[var(--color-canvas)]/50 border border-[var(--color-hairline-soft)] text-[13px] font-medium text-[var(--color-body)] group hover:border-[var(--color-primary)] transition-all"
                       >
+<<<<<<< Updated upstream
+=======
+                        {showDocFilter && (
+                          <input
+                            type="checkbox"
+                            checked={selectedFiles.includes(namaFile)}
+                            onChange={(e) => {
+                              if (e.target.checked) setSelectedFiles([...selectedFiles, namaFile]);
+                              else setSelectedFiles(selectedFiles.filter((f) => f !== namaFile));
+                            }}
+                            className="accent-[var(--color-primary)]"
+                          />
+                        )}
+>>>>>>> Stashed changes
                         <FileText
                           size={16}
                           className={`shrink-0 ${dotColor}`}
@@ -507,6 +578,69 @@ export default function Home() {
             )}
           </div>
         </div>
+
+        {/* BOTTOM CONTROLS */}
+        <div className="border-t border-[var(--color-hairline-soft)] p-4 flex items-center justify-between">
+          <div className="flex gap-2">
+            <button onClick={() => setShowSettings(!showSettings)} className="p-2 text-[var(--color-muted)] hover:text-[var(--color-primary)]"><Gear size={18} /></button>
+            <button onClick={exportChat} className="p-2 text-[var(--color-muted)] hover:text-[var(--color-primary)]" title="Export Chat"><DownloadSimple size={18} /></button>
+            <button onClick={() => setShowTutorial(true)} className="p-2 text-[var(--color-muted)] hover:text-[var(--color-primary)]" title="Panduan & Kamus"><Info size={18} /></button>
+          </div>
+          <ThemeToggle />
+        </div>
+
+        {/* SETTINGS POPUP */}
+        {showSettings && (
+          <div className="absolute bottom-16 left-5 w-[260px] bg-[var(--color-surface-sidebar)] border border-[var(--color-hairline)] rounded-xl shadow-2xl p-4 text-[12px] animate-in slide-in-from-bottom-4 fade-in duration-200">
+            <h4 className="font-bold mb-3 text-[var(--color-ink)]">Pengaturan AI</h4>
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <label className="text-[var(--color-muted)] cursor-pointer select-none" onClick={() => setShowCitations(!showCitations)}>Citation (Tombol Sumber):</label>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={showCitations}
+                  onClick={() => setShowCitations(!showCitations)}
+                  className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${showCitations ? 'bg-[var(--color-primary)]' : 'bg-gray-300'}`}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${showCitations ? 'translate-x-[22px]' : 'translate-x-0.5'}`} />
+                </button>
+              </div>
+              <div className="flex items-center justify-between">
+                <label className="text-[var(--color-muted)] cursor-pointer select-none" onClick={() => setShowDocFilter(!showDocFilter)}>Filter Dokumen:</label>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={showDocFilter}
+                  onClick={() => setShowDocFilter(!showDocFilter)}
+                  className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${showDocFilter ? 'bg-[var(--color-primary)]' : 'bg-gray-300'}`}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${showDocFilter ? 'translate-x-[22px]' : 'translate-x-0.5'}`} />
+                </button>
+              </div>
+              <hr className="border-[var(--color-hairline-soft)] my-1" />
+              <div>
+                <label className="block text-[var(--color-muted)] mb-1">Temperature (0.0-1.0):</label>
+                <input type="number" step="0.1" min="0" max="1" value={temperature} onChange={(e) => setTemperature(parseFloat(e.target.value))} className="w-full p-1 border rounded bg-[var(--color-canvas)]/50 border border-[var(--color-hairline-soft)]" />
+                <p className="text-[10px] text-[var(--color-muted)] mt-0.5">Semakin tinggi, jawaban lebih kreatif & acak.</p>
+              </div>
+              <div>
+                <label className="block text-[var(--color-muted)] mb-1">Top-K Docs:</label>
+                <input type="number" min="1" max="20" value={k} onChange={(e) => setK(parseInt(e.target.value))} className="w-full p-1 border rounded bg-[var(--color-canvas)]/50 border border-[var(--color-hairline-soft)]" />
+                <p className="text-[10px] text-[var(--color-muted)] mt-0.5">Jumlah dokumen yang diambil sebagai konteks.</p>
+              </div>
+              <div>
+                <label className="block text-[var(--color-muted)] mb-1">Model AI:</label>
+                <select value={model} onChange={(e) => setModel(e.target.value)} className="w-full p-1 border rounded bg-[var(--color-canvas)]/50 border border-[var(--color-hairline-soft)]">
+                  <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Flash Lite</option>
+                  <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                  <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
+                </select>
+              </div>
+            </div>
+            <button onClick={() => setShowSettings(false)} className="mt-4 w-full bg-[var(--color-primary)] text-white text-[14px] font-semibold py-2 px-3 rounded-md  hover:bg-[var(--color-primary-active)] transition ">Tutup</button>
+          </div>
+        )}
       </div>
 
       {/* CHAT AREA */}
@@ -587,7 +721,7 @@ export default function Home() {
                     <div className="font-serif">
                       {streamingText ? (
                         <>
-                          <TypingText text={streamingText} />
+                          <TypingText text={streamingText} formatJawabanAI={formatJawabanAI} />
                           <span className="inline-block w-[2px] h-[1em] bg-[var(--color-primary)] ml-0.5 animate-pulse align-middle" />
                         </>
                       ) : (
@@ -595,7 +729,15 @@ export default function Home() {
                           <span className="typing-dot" />
                           <span className="typing-dot" />
                           <span className="typing-dot" />
-                        </div>
+        <div className="mt-auto border-t border-[var(--color-hairline-soft)] p-4 flex items-center justify-between">
+          <div className="flex gap-2">
+            <button onClick={() => setShowSettings(!showSettings)} className="p-2 text-[var(--color-muted)] hover:text-[var(--color-primary)]"><Gear size={18} /></button>
+            <button onClick={exportChat} className="p-2 text-[var(--color-muted)] hover:text-[var(--color-primary)]"><DownloadSimple size={18} /></button>
+          </div>
+          <ThemeToggle />
+        </div>
+      </div>
+
                       )}
                     </div>
                   </div>
@@ -620,16 +762,94 @@ export default function Home() {
                 className="flex-1 bg-transparent border-none text-[15px] text-[var(--color-ink)] placeholder:text-[var(--color-muted)] focus:outline-none focus:ring-0 font-sans"
               />
               <button
-                onClick={kirimPesan}
-                disabled={loading || !pertanyaan.trim()}
-                className="bg-[var(--color-primary)] text-white p-2 rounded-lg hover:bg-[var(--color-primary-active)] transition disabled:opacity-40 disabled:cursor-not-allowed shadow-sm shrink-0"
+                onClick={loading ? () => abortController?.abort() : kirimPesan}
+                className={`p-2 rounded-lg transition shadow-sm shrink-0 ${
+                  loading ? "bg-red-500 hover:bg-red-600 text-white" : "bg-[var(--color-primary)] text-white hover:bg-[var(--color-primary-active)]"
+                }`}
               >
-                <ArrowUp size={18} weight="bold" />
+                {loading ? <X size={18} weight="bold" /> : <ArrowUp size={18} weight="bold" />}
               </button>
             </div>
           </div>
         </div>
       </div>
+
+      {/* TUTORIAL POPUP MODAL (Diletakkan di level atas agar menutupi semuanya) */}
+      {showTutorial && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-[var(--color-canvas)] border border-[var(--color-hairline)] rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] overflow-hidden flex flex-col animate-in zoom-in-95 duration-200">
+            <div className="flex items-center justify-between p-4 border-b border-[var(--color-hairline)] bg-[var(--color-surface-sidebar)]">
+              <h3 className="text-lg font-bold text-[var(--color-ink)] flex items-center gap-2">
+                <Info size={24} className="text-[var(--color-primary)]" weight="fill" />
+                Buku Panduan & Kamus Istilah AI
+              </h3>
+              <button onClick={() => setShowTutorial(false)} className="p-1.5 text-[var(--color-muted)] hover:bg-[var(--color-canvas)] rounded-md transition-colors">
+                <X size={20} weight="bold" />
+              </button>
+            </div>
+            
+            <div className="overflow-y-auto p-6 flex flex-col gap-8 text-[14px] leading-relaxed text-[var(--color-body)]">
+              
+              {/* Panduan */}
+              <section>
+                <h4 className="text-base font-bold text-[var(--color-ink)] mb-4 flex items-center gap-2">
+                  <span className="bg-[var(--color-primary)]/10 text-[var(--color-primary)] w-6 h-6 rounded flex items-center justify-center text-xs">1</span>
+                  Panduan Penggunaan Aplikasi
+                </h4>
+                <ul className="space-y-4 pl-8 list-decimal marker:text-[var(--color-primary)] marker:font-bold">
+                  <li>
+                    <strong>Unggah Dokumen Anda:</strong> Klik area bertuliskan "Pilih file..." di panel sebelah kiri. Anda dapat memasukkan berkas berformat PDF, Word (DOCX), Excel (XLSX), atau presentasi (PPTX). Tunggu hingga muncul notifikasi sukses.
+                  </li>
+                  <li>
+                    <strong>Pilih Dokumen yang Akan Ditanyakan:</strong> Lihat ke bagian "Dokumen Tersimpan" di sebelah kiri. Pastikan Anda <strong>mencentang kotak</strong> di sebelah nama dokumen yang ingin Anda tanyakan. Asisten hanya akan membaca dokumen yang dicentang.
+                  </li>
+                  <li>
+                    <strong>Mulai Chatting:</strong> Ketik pertanyaan Anda di kolom bagian bawah. Tekan <em>Enter</em> atau tombol panah ke atas untuk mengirim pesan.
+                  </li>
+                  <li>
+                    <strong>Cek Sumber Halaman (Bukti Jawaban):</strong> Di dalam teks jawaban asisten, Anda akan melihat tombol kecil (misalnya: <em>namafile.pdf hal 4</em>). Klik tombol tersebut, dan aplikasi akan membuka pratinjau dokumen asli tepat di halaman tempat informasi itu ditemukan.
+                  </li>
+                </ul>
+              </section>
+
+              <hr className="border-[var(--color-hairline-soft)]" />
+
+              {/* Kamus */}
+              <section>
+                <h4 className="text-base font-bold text-[var(--color-ink)] mb-4 flex items-center gap-2">
+                  <span className="bg-[var(--color-primary)]/10 text-[var(--color-primary)] w-6 h-6 rounded flex items-center justify-center text-xs">2</span>
+                  Kamus Istilah AI (Bahasa Awam)
+                </h4>
+                <div className="grid gap-4">
+                  <div className="p-4 rounded-lg bg-[var(--color-surface-sidebar)] border border-[var(--color-hairline-soft)]">
+                    <strong className="text-[var(--color-ink)] block mb-1">RAG (Sistem Buka Buku)</strong>
+                    <p>Ini adalah nama teknologi aplikasi ini. Daripada membiarkan AI menjawab dari ingatannya sendiri (yang kadang bisa mengarang), teknologi RAG memaksa AI untuk "membaca" dokumen Anda dulu dan menjawab berdasarkan teks yang ada di dalamnya.</p>
+                  </div>
+                  <div className="p-4 rounded-lg bg-[var(--color-surface-sidebar)] border border-[var(--color-hairline-soft)]">
+                    <strong className="text-[var(--color-ink)] block mb-1">Temperature (Pengaturan Gaya Bahasa)</strong>
+                    <p>Angka antara 0 hingga 1 yang menentukan cara asisten menjawab. Jika disetel mendekati <strong>0</strong>, jawaban akan sangat kaku dan persis seperti teks di dokumen. Jika disetel mendekati <strong>1</strong>, asisten akan merangkai kata dengan lebih luwes dan bercerita.</p>
+                  </div>
+                  <div className="p-4 rounded-lg bg-[var(--color-surface-sidebar)] border border-[var(--color-hairline-soft)]">
+                    <strong className="text-[var(--color-ink)] block mb-1">Top-K Docs (Batas Bacaan AI)</strong>
+                    <p>Menentukan seberapa banyak cuplikan teks yang diambil asisten dari dokumen Anda untuk menjawab satu pertanyaan. Semakin besar angkanya (misal: 10), semakin luas konteks yang dibaca asisten, tetapi prosesnya mungkin sedikit lebih lama.</p>
+                  </div>
+                  <div className="p-4 rounded-lg bg-[var(--color-surface-sidebar)] border border-[var(--color-hairline-soft)]">
+                    <strong className="text-[var(--color-ink)] block mb-1">Model AI (Pilihan Tipe Asisten)</strong>
+                    <p>Ini adalah pilihan "otak" di balik asisten Anda. Model <strong>Flash Lite</strong> cocok untuk respons kilat sehari-hari, sedangkan model <strong>Pro</strong> lebih lambat namun jauh lebih pintar dalam menganalisis dokumen yang rumit.</p>
+                  </div>
+                </div>
+              </section>
+
+            </div>
+            <div className="p-4 border-t border-[var(--color-hairline)] bg-[var(--color-surface-sidebar)] flex justify-end">
+              <button onClick={() => setShowTutorial(false)} className="px-5 py-2 bg-[var(--color-primary)] text-white rounded-md font-medium hover:bg-[var(--color-primary-active)] transition-colors">
+                Mengerti
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
