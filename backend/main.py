@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from typing import List, Optional
 
 import comtypes.client
 import pythoncom
@@ -193,30 +194,48 @@ async def hapus_dokumen(filename: str):
 # ==========================================
 class Pertanyaan(BaseModel):
     teks: str
-<<<<<<< Updated upstream
-=======
-    selected_files: Optional[List[str]] = []
-    history: Optional[List[dict]] = []
-    temperature: Optional[float] = 0.5
-    k: Optional[int] = 10
->>>>>>> Stashed changes
+    selected_files: Optional[List[str]] = None
+    history: Optional[List[dict]] = None
+    temperature: Optional[float] = None
+    k: Optional[int] = None
 
 @app.post("/api/chat")
 async def chat_ai(pertanyaan: Pertanyaan):
     try:
-        dokumen_relevan = retriever.invoke(pertanyaan.teks)
+        temp = pertanyaan.temperature or 0.5
+        k_val = pertanyaan.k or 10
+        current_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=temp)
+        
+        filter_dict = None
+        if pertanyaan.selected_files:
+            if len(pertanyaan.selected_files) == 1:
+                filter_dict = {"source": pertanyaan.selected_files[0]}
+            else:
+                filter_dict = {"source": {"$in": pertanyaan.selected_files}}
+                
+        if filter_dict:
+            dokumen_relevan = vektor_db.similarity_search(
+                query=pertanyaan.teks, 
+                k=k_val, 
+                filter=filter_dict
+            )
+        else:
+            retriever_dynamic = vektor_db.as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
+            dokumen_relevan = retriever_dynamic.invoke(pertanyaan.teks)
+        
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )
         
-        chain = prompt | llm | StrOutputParser()
-        jawaban = chain.invoke({"context": konteks_dengan_sumber, "question": pertanyaan.teks})
+        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in pertanyaan.history[-6:]]) if pertanyaan.history else ""
+        full_context = f"History:\n{history_text}\n\nKonteks Dokumen:\n{konteks_dengan_sumber}"
+        
+        chain = prompt | current_llm | StrOutputParser()
+        jawaban = chain.invoke({"context": full_context, "question": pertanyaan.teks})
         
         return {"jawaban": jawaban}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-from fastapi.responses import FileResponse, StreamingResponse
 
 # ==========================================
 # ENDPOINT: DOWNLOAD FILE
@@ -297,9 +316,6 @@ async def preview_file(filename: str):
 @app.post("/api/chat/stream")
 async def chat_ai_stream(pertanyaan: Pertanyaan):
     try:
-<<<<<<< Updated upstream
-        dokumen_relevan = retriever.invoke(pertanyaan.teks)
-=======
         # Gunakan parameter dari frontend jika ada
         temp = pertanyaan.temperature or 0.5
         k_val = pertanyaan.k or 10
@@ -324,8 +340,6 @@ async def chat_ai_stream(pertanyaan: Pertanyaan):
             # Re-init retriever untuk k yang dinamis
             retriever_dynamic = vektor_db.as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
             dokumen_relevan = retriever_dynamic.invoke(pertanyaan.teks)
-        
->>>>>>> Stashed changes
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )
