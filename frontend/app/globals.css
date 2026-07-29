@@ -149,3 +149,31 @@ body {
     --color-hairline-soft: #202020;
   }
 }
+
+/* Styling otomatis untuk link unduhan agar berbentuk pill seperti tombol sitasi */
+a[href*="/api/generated/download/"],
+a[href*="/api/files/download/"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.75rem;
+  background-color: rgba(245, 78, 0, 0.15) !important;
+  color: var(--color-primary) !important;
+  border-radius: 9999px;
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid rgba(245, 78, 0, 0.3) !important;
+  text-decoration: none !important;
+  transition: all 0.2s;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+}
+
+a[href*="/api/generated/download/"]:hover,
+a[href*="/api/files/download/"]:hover {
+  background-color: rgba(245, 78, 0, 0.25) !important;
+}
+
+a[href*="/api/generated/download/"] strong,
+a[href*="/api/files/download/"] strong {
+  font-weight: 600;
+}

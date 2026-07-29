@@ -72,9 +72,9 @@ export default function PDFPreview({ filename, pageNumber, onClose }: PDFPreview
             href={downloadUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="mt-4 bg-[var(--color-primary)] text-white px-4 py-2 rounded-md font-medium text-[13px] hover:bg-[var(--color-primary-active)] transition shadow-sm"
+            className="inline-flex items-center gap-1.5 px-3 py-1 bg-[#f54e00]/15 hover:bg-[#f54e00]/25 text-[var(--color-primary)] rounded-full text-[12px] font-semibold border border-[#f54e00]/30 transition-all no-underline shadow-sm"
           >
-            Unduh Dokumen
+            <DownloadSimple weight="bold" size={12} /> Unduh Dokumen
           </a>
         </div>
       </div>
@@ -90,8 +90,12 @@ export default function PDFPreview({ filename, pageNumber, onClose }: PDFPreview
         <div className="flex justify-between items-center">
           <h3 className="font-bold text-[15px] text-[var(--color-ink)] truncate max-w-[70%]">{filename}</h3>
           <div className="flex items-center gap-2">
-            <a href={downloadUrl} className="text-[13px] font-semibold text-white bg-[var(--color-primary)] hover:bg-[var(--color-primary-active)] px-3 py-1.5 rounded-md flex items-center gap-1 shadow-sm transition-colors" download>
-              <DownloadSimple weight="bold" size={14} /> Unduh
+            <a 
+              href={downloadUrl} 
+              className="inline-flex items-center gap-1.5 px-3 py-1 bg-[#f54e00]/15 hover:bg-[#f54e00]/25 text-[var(--color-primary)] rounded-full text-[12px] font-semibold border border-[#f54e00]/30 transition-all no-underline shadow-sm" 
+              download
+            >
+              <DownloadSimple weight="bold" size={12} /> {filename}
             </a>
             <button onClick={onClose} className="text-[var(--color-muted)] hover:text-[var(--color-primary)] hover:bg-[var(--color-hairline-soft)] p-1.5 rounded transition">
               <X size={18} weight="bold" />

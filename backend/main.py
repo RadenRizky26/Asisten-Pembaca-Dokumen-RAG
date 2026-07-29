@@ -1,5 +1,9 @@
 import os
 import shutil
+import re
+import json
+import uuid
+from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -13,22 +17,22 @@ import pythoncom
 # Pustaka AI LangChain
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_postgres import PGVector
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
-# Pustaka Ekstraksi Dokumen
+# Pustaka Ekstraksi & Pembuatan Dokumen
 from pypdf import PdfReader
 import docx
 from pptx import Presentation
 import openpyxl
+from fpdf import FPDF
 
 # Inisialisasi FastAPI
 app = FastAPI(title="API Asisten Pembaca Dokumen")
 
-# Mengizinkan Next.js (berjalan di port 3000) untuk mengakses API ini (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"], 
@@ -42,30 +46,48 @@ app.add_middleware(
 # ==========================================
 load_dotenv()
 embeddings = HuggingFaceEmbeddings(model_name="paraphrase-multilingual-MiniLM-L12-v2")
-vektor_db = Chroma(persist_directory="./database", embedding_function=embeddings)
-# Peningkatan k=10 dan menggunakan search_type='mmr' untuk keragaman dokumen
-retriever = vektor_db.as_retriever(search_type="mmr", search_kwargs={"k": 10, "fetch_k": 20})
+vektor_db = PGVector(
+    embeddings=embeddings,
+    collection_name="dokumen_rag",
+    connection=os.getenv("DATABASE_URL"),
+    use_jsonb=True,
+)
+retriever = vektor_db.as_retriever(search_kwargs={"k": 5})
 llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0.5)
 
+# --- PERBAIKAN: INSTRUKSI PROMPT YANG SANGAT KETAT ---
 template_instruksi = """
-    Kamu adalah asisten AI yang cerdas, ramah, dan interaktif.
-    Konteks dokumen di bawah ini telah dilengkapi dengan penanda halaman seperti --- Halaman 1 ---.
+    Kamu adalah asisten AI spesialis pembaca dokumen.
+    Konteks dokumen di bawah ini telah dilengkapi dengan metadata [Sumber: Nama_File, halaman X].
 
-    Aturan menjawab:
-    1. Berikan jawaban yang SANGAT DETAIL dan MENYELURUH.
-    2. Kamu WAJIB melakukan sintesis dari SEMUA dokumen yang tersedia jika informasi tersebar. Jangan hanya terpaku pada satu dokumen saja.
-    3. Cari tanda --- Halaman X --- atau --- Slide X --- dalam konteks untuk menentukan referensi halaman.
-    4. Kamu WAJIB menyebutkan sumber referensi secara natural di dalam penjelasanmu. Contoh: "Menurut dokumen A halaman 1... dan dokumen B slide 2..." atau cantumkan "(Sumber: A.pdf, halaman 1)" di akhir poin penjelasan.
-    5. Gunakan format yang rapi (bullet points, paragraf, atau teks tebal) agar mudah dibaca.
-    6. Jika informasi TIDAK ADA di dalam konteks, katakan: "Maaf, saya belum menemukan informasi tersebut di dalam dokumen."
+    ATURAN DASAR MENJAWAB (PERTANYAAN BIASA):
+    1. Jawablah pertanyaan pengguna dengan SANGAT DETAIL dan akurat berdasarkan konteks.
+    2. SITASI ADALAH KEWAJIBAN MUTLAK! Setiap kali kamu menuliskan fakta, pasal, penjelasan, atau data dari dokumen, kamu WAJIB menempelkan sitasi tepat di ujung kalimat tersebut.
+       -> Format Sitasi yang Wajib (Inline Citation): **[Sumber: Nama_File.pdf, halaman X]**
+       -> Contoh penulisan: "...diancam dengan pidana penjara paling lama sembilan tahun [Sumber: KUHP.pdf, halaman 89]."
+       -> DILARANG membuat daftar pustaka terpisah di bawah. Sitasi harus menyatu di dalam paragraf/poin.
+    3. JIKA pengguna HANYA BERTANYA (tidak meminta file), JAWABLAH SEPERTI BIASA. DILARANG KERAS memberikan tombol unduhan, link download, atau membuat tag dokumen di akhir jawabanmu.
+
+    JALUR KHUSUS A (PENGGUNA MEMINTA DOWNLOAD FILE ASLI):
+    - HANYA aktif jika pengguna secara sadar mengetik: "minta file asli", "download dokumennya", "berikan file pdfnya".
+    - Berikan tautan ini di akhir: 📥 [Unduh Nama_File_Asli.pdf](http://localhost:8000/api/files/download/Nama_File_Asli.pdf)
+    - JIKA TIDAK DIMINTA, JANGAN BERIKAN LINK INI.
+
+    JALUR KHUSUS B (PENGGUNA MEMINTA DIBUATKAN DOKUMEN BARU):
+    - HANYA aktif jika pengguna mengetik: "buatkan PDF", "jadikan file", "buatkan rangkuman ke txt".
+    - PERINGATAN PENTING: Jika pengguna meminta dibuatkan PDF/File, kamu TETAP WAJIB MENJAWAB PERTANYAAN DI CHAT TERLEBIH DAHULU SECARA LENGKAP DENGAN SITASI seperti biasa. Setelah SELURUH jawaban chat selesai (termasuk sitasi), barulah di PALING BAWAH sekali kamu tambahkan tag rahasia berikut:
+      <NAMA_FILE>Nama_File_Baru.pdf</NAMA_FILE>
+      <ISI_DOKUMEN>
+      [Tuliskan seluruh materi, rangkuman, atau data yang diminta pengguna di sini dengan lengkap dan rapi]
+      </ISI_DOKUMEN>
 
     Konteks Dokumen:
     {context}
 
     Pertanyaan Pengguna: {question}
 
-    Jawaban Detail beserta Referensi:
-    """
+    Jawaban:
+"""
 prompt = ChatPromptTemplate.from_template(template_instruksi)
 
 # ==========================================
@@ -79,16 +101,12 @@ async def upload_dokumen(file: UploadFile = File(...)):
     filename = file.filename
     file_path = f"./kumpulan_dokumen/{filename}"
     
-    # Simpan file fisik
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
     ekstensi = filename.lower().split('.')[-1]
-    
-    # Kumpulan dokumen terstruktur dengan metadata halaman
     documents = []
     
-    # Ekstraksi Teks
     try:
         if ekstensi == "pdf":
             reader = PdfReader(file_path)
@@ -97,18 +115,12 @@ async def upload_dokumen(file: UploadFile = File(...)):
                 t = hal.extract_text()
                 if t:
                     page_text = f"\n--- Halaman {page_num} ---\n{t}"
-                    documents.append(Document(
-                        page_content=page_text, 
-                        metadata={"source": filename, "page": page_num}
-                    ))
+                    documents.append(Document(page_content=page_text, metadata={"source": filename, "page": page_num}))
         elif ekstensi == "docx":
             doc = docx.Document(file_path)
             teks_dokumen = "\n".join([p.text for p in doc.paragraphs])
             if teks_dokumen.strip():
-                documents.append(Document(
-                    page_content=teks_dokumen, 
-                    metadata={"source": filename}
-                ))
+                documents.append(Document(page_content=teks_dokumen, metadata={"source": filename}))
         elif ekstensi == "pptx":
             prs = Presentation(file_path)
             for i, slide in enumerate(prs.slides):
@@ -120,10 +132,7 @@ async def upload_dokumen(file: UploadFile = File(...)):
                         slide_text += shape.text + "\n"
                         has_text = True
                 if has_text:
-                    documents.append(Document(
-                        page_content=slide_text, 
-                        metadata={"source": filename, "page": slide_num}
-                    ))
+                    documents.append(Document(page_content=slide_text, metadata={"source": filename, "page": slide_num}))
         elif ekstensi == "xlsx":
             wb = openpyxl.load_workbook(file_path, data_only=True)
             teks_dokumen = ""
@@ -135,21 +144,16 @@ async def upload_dokumen(file: UploadFile = File(...)):
                     if teks_baris.strip(): 
                         teks_dokumen += teks_baris + "\n"
             if teks_dokumen.strip():
-                documents.append(Document(
-                    page_content=teks_dokumen, 
-                    metadata={"source": filename}
-                ))
+                documents.append(Document(page_content=teks_dokumen, metadata={"source": filename}))
         
         if documents:
             pemotong = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=400)
             potongan = pemotong.split_documents(documents)
             
-            # Pastikan setiap potongan memiliki marker halaman (berguna jika teks sangat panjang dan terpecah)
             for chunk in potongan:
                 page = chunk.metadata.get("page")
                 if page is not None:
                     if "--- Halaman" not in chunk.page_content and "--- Slide" not in chunk.page_content:
-                        # Tambahkan marker sesuai ekstensi (fallback ke Halaman)
                         tipe = "Slide" if ekstensi == "pptx" else "Halaman"
                         chunk.page_content = f"\n--- {tipe} {page} ---\n{chunk.page_content}"
                         
@@ -160,7 +164,7 @@ async def upload_dokumen(file: UploadFile = File(...)):
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-       
+        
 # ==========================================
 # ENDPOINT: MELIHAT & MENGHAPUS DOKUMEN
 # ==========================================
@@ -169,8 +173,6 @@ async def lihat_daftar_dokumen():
     try:
         if not os.path.exists("./kumpulan_dokumen"):
             return {"files": []}
-        
-        # Ambil file di folder kumpulan_dokumen, kecualikan folder 'preview'
         daftar_file = [f for f in os.listdir("./kumpulan_dokumen") if os.path.isfile(os.path.join("./kumpulan_dokumen", f))]
         return {"files": daftar_file}
     except Exception as e:
@@ -183,14 +185,16 @@ async def hapus_dokumen(filename: str):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
     try:
         os.remove(file_path)
-        # Hapus data dari vector db berdasarkan metadata source
-        vektor_db.delete(where={"source": filename})
+        try:
+            vektor_db.delete(where={"source": filename})
+        except:
+            pass
         return {"status": "sukses", "pesan": f"{filename} dihapus!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# ENDPOINT 2: TANYA JAWAB (CHAT)
+# ENDPOINT 2: TANYA JAWAB (CHAT NON-STREAMING)
 # ==========================================
 class Pertanyaan(BaseModel):
     teks: str
@@ -214,11 +218,7 @@ async def chat_ai(pertanyaan: Pertanyaan):
                 filter_dict = {"source": {"$in": pertanyaan.selected_files}}
                 
         if filter_dict:
-            dokumen_relevan = vektor_db.similarity_search(
-                query=pertanyaan.teks, 
-                k=k_val, 
-                filter=filter_dict
-            )
+            dokumen_relevan = vektor_db.similarity_search(query=pertanyaan.teks, k=k_val, filter=filter_dict)
         else:
             retriever_dynamic = vektor_db.as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
             dokumen_relevan = retriever_dynamic.invoke(pertanyaan.teks)
@@ -233,12 +233,44 @@ async def chat_ai(pertanyaan: Pertanyaan):
         chain = prompt | current_llm | StrOutputParser()
         jawaban = chain.invoke({"context": full_context, "question": pertanyaan.teks})
         
+        match_isi = re.search(r"<ISI_DOKUMEN>(.*?)</ISI_DOKUMEN>", jawaban, re.DOTALL)
+        match_nama = re.search(r"<NAMA_FILE>(.*?)</NAMA_FILE>", jawaban)
+
+        if match_isi and match_nama:
+            isi_teks = match_isi.group(1).strip()
+            nama_file_asli = match_nama.group(1).strip()
+            
+            nama_unik = f"{uuid.uuid4().hex[:6]}_{nama_file_asli}"
+            os.makedirs("./dokumen_hasil", exist_ok=True)
+            lokasi_simpan = f"./dokumen_hasil/{nama_unik}"
+            
+            if nama_file_asli.lower().endswith('.pdf'):
+                pdf = FPDF()
+                pdf.add_page()
+                pdf.set_font("Arial", size=11)
+                isi_teks_pdf = isi_teks.encode('latin-1', 'replace').decode('latin-1')
+                pdf.multi_cell(0, 7, txt=isi_teks_pdf)
+                pdf.output(lokasi_simpan)
+            else:
+                with open(lokasi_simpan, "w", encoding="utf-8") as f:
+                    f.write(isi_teks)
+            
+            link_download = f"http://localhost:8000/api/generated/download/{nama_unik}"
+            jawaban_bersih = re.sub(r"<NAMA_FILE>.*?</NAMA_FILE>", "", jawaban)
+            jawaban_bersih = re.sub(
+                r"<ISI_DOKUMEN>.*?</ISI_DOKUMEN>", 
+                f"\n\n✅ **Dokumen berhasil dibuat!**\n📥 [**Klik di sini untuk mengunduh {nama_file_asli}**]({link_download})\n\n", 
+                jawaban_bersih, 
+                flags=re.DOTALL
+            )
+            jawaban = jawaban_bersih.strip()
+
         return {"jawaban": jawaban}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# ENDPOINT: DOWNLOAD FILE
+# ENDPOINT: DOWNLOAD FILE (ASLI & HASIL AI)
 # ==========================================
 @app.get("/api/files/download/{filename}")
 async def download_file(filename: str):
@@ -249,10 +281,17 @@ async def download_file(filename: str):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
     return FileResponse(file_path)
 
-@app.get("/api/files/preview/{filename}")
+@app.get("/api/generated/download/{filename}")
+async def download_generated_file(filename: str):
+    import urllib.parse
+    filename = urllib.parse.unquote(filename)
+    file_path = os.path.join("./dokumen_hasil", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File hasil tidak ditemukan.")
+    return FileResponse(file_path, filename=filename)
 
+@app.get("/api/files/preview/{filename}")
 async def preview_file(filename: str):
-    # Mengatasi encoded URL (e.g. Analisis%20TRAM.pptx)
     import urllib.parse
     filename = urllib.parse.unquote(filename)
     
@@ -261,11 +300,9 @@ async def preview_file(filename: str):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
         
     ekstensi = filename.lower().split('.')[-1]
-    
     if ekstensi == "pdf":
         return FileResponse(file_path)
         
-    # Buat folder preview jika belum ada
     preview_dir = os.path.abspath("./kumpulan_dokumen/preview")
     if not os.path.exists(preview_dir):
         os.makedirs(preview_dir)
@@ -273,32 +310,29 @@ async def preview_file(filename: str):
     pdf_filename = f"{filename}.pdf"
     pdf_path = os.path.join(preview_dir, pdf_filename)
     
-    # Jika sudah di-convert, langsung return
     if os.path.exists(pdf_path):
         return FileResponse(pdf_path)
         
-    # Convert menggunakan comtypes (Butuh MS Office terinstall di Windows)
     try:
         pythoncom.CoInitialize()
         if ekstensi in ["doc", "docx"]:
             word = comtypes.client.CreateObject("Word.Application")
             word.Visible = False
             doc = word.Documents.Open(file_path)
-            doc.SaveAs(pdf_path, FileFormat=17) # 17 = wdFormatPDF
+            doc.SaveAs(pdf_path, FileFormat=17) 
             doc.Close()
             word.Quit()
         elif ekstensi in ["ppt", "pptx"]:
             powerpoint = comtypes.client.CreateObject("Powerpoint.Application")
-            # PowerPoint tidak mengizinkan .Visible = False di beberapa versi, kita hapus
             ppt = powerpoint.Presentations.Open(file_path, WithWindow=False)
-            ppt.SaveAs(pdf_path, 32) # 32 = ppSaveAsPDF
+            ppt.SaveAs(pdf_path, 32) 
             ppt.Close()
             powerpoint.Quit()
         elif ekstensi in ["xls", "xlsx"]:
             excel = comtypes.client.CreateObject("Excel.Application")
             excel.Visible = False
             wb = excel.Workbooks.Open(file_path)
-            wb.ExportAsFixedFormat(0, pdf_path) # 0 = xlTypePDF
+            wb.ExportAsFixedFormat(0, pdf_path) 
             wb.Close(False)
             excel.Quit()
         else:
@@ -312,15 +346,14 @@ async def preview_file(filename: str):
         return FileResponse(pdf_path)
     raise HTTPException(status_code=500, detail="File PDF tidak terbentuk.")
 
-
+# ==========================================
+# ENDPOINT: CHAT STREAMING (DENGAN BUFFER & ANTI-ERROR)
+# ==========================================
 @app.post("/api/chat/stream")
 async def chat_ai_stream(pertanyaan: Pertanyaan):
     try:
-        # Gunakan parameter dari frontend jika ada
         temp = pertanyaan.temperature or 0.5
         k_val = pertanyaan.k or 10
-        
-        # Re-inisialisasi LLM dengan temp baru
         current_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=temp)
 
         filter_dict = None
@@ -331,43 +364,136 @@ async def chat_ai_stream(pertanyaan: Pertanyaan):
                 filter_dict = {"source": {"$in": pertanyaan.selected_files}}
                 
         if filter_dict:
-            dokumen_relevan = vektor_db.similarity_search(
-                query=pertanyaan.teks, 
-                k=k_val, 
-                filter=filter_dict
-            )
+            dokumen_relevan = vektor_db.similarity_search(query=pertanyaan.teks, k=k_val, filter=filter_dict)
         else:
-            # Re-init retriever untuk k yang dinamis
             retriever_dynamic = vektor_db.as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
             dokumen_relevan = retriever_dynamic.invoke(pertanyaan.teks)
+            
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )
         
-        # Format history untuk prompt
         history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in pertanyaan.history[-6:]]) if pertanyaan.history else ""
-        
         full_context = f"History:\n{history_text}\n\nKonteks Dokumen:\n{konteks_dengan_sumber}"
         
         chain = prompt | current_llm | StrOutputParser()
         
         async def generate():
+            import json, re
+            full_response = ""
+            is_generating_file = False
+            buffer_stream = "" 
+            
             async for chunk in chain.astream({"context": full_context, "question": pertanyaan.teks}):
-                if chunk:
-                    yield f"data: {json.dumps({'token': chunk})}\n\n"
+                full_response += chunk
+                
+                # PERBAIKAN 1: Jadikan pengecekan Tidak Peduli Huruf Besar/Kecil
+                response_upper = full_response.upper()
+                
+                if "<NAMA_FILE>" in response_upper or "<ISI_DOKUMEN>" in response_upper:
+                    if not is_generating_file:
+                        is_generating_file = True
+                        # Kirim sisa teks normal di buffer sebelum tag agar tidak terpotong
+                        if buffer_stream:
+                            last_angle = buffer_stream.rfind("<")
+                            if last_angle != -1:
+                                safe_text = buffer_stream[:last_angle]
+                                if safe_text:
+                                    yield f"data: {json.dumps({'token': safe_text})}\n\n"
+                            else:
+                                yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
+                            buffer_stream = ""
+                        pesan_tunggu = "\n\n*(Sedang menyusun dokumen, mohon tunggu...)*\n"
+                        yield f"data: {json.dumps({'token': pesan_tunggu})}\n\n"
+                    continue 
+                
+                if not is_generating_file:
+                    buffer_stream += chunk
+                    last_angle_idx = buffer_stream.rfind("<")
+                    
+                    if last_angle_idx != -1:
+                        potential_tag = buffer_stream[last_angle_idx:].upper()
+                        if "<NAMA_FILE>".startswith(potential_tag) or "<ISI_DOKUMEN>".startswith(potential_tag):
+                            safe_text = buffer_stream[:last_angle_idx]
+                            if safe_text:
+                                yield f"data: {json.dumps({'token': safe_text})}\n\n"
+                            buffer_stream = buffer_stream[last_angle_idx:] 
+                        else:
+                            yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
+                            buffer_stream = ""
+                    else:
+                        yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
+                        buffer_stream = ""
+
+            if buffer_stream and not is_generating_file:
+                yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
+
+            # ---------------------------------------------------------
+            # PROSES PEMBUATAN FILE FISIK SETELAH STREAMING SELESAI
+            # ---------------------------------------------------------
+            if is_generating_file:
+                import uuid, os
+                from fpdf import FPDF
+                
+                # PERBAIKAN 2: Gunakan IGNORECASE dan toleransi jika AI lupa menutup tag
+                match_isi = re.search(r"<ISI_DOKUMEN>(.*?)(?:</ISI_DOKUMEN>|$)", full_response, re.DOTALL | re.IGNORECASE)
+                match_nama = re.search(r"<NAMA_FILE>(.*?)</NAMA_FILE>", full_response, re.IGNORECASE)
+                
+                if match_isi and match_nama:
+                    isi_teks = match_isi.group(1).strip()
+                    nama_file_asli = match_nama.group(1).strip()
+                    
+                    # Hapus simbol aneh dari nama file agar tidak error di Windows
+                    nama_file_asli = re.sub(r'[\\/*?:"<>|]', "", nama_file_asli)
+                    
+                    nama_unik = f"{uuid.uuid4().hex[:6]}_{nama_file_asli}"
+                    os.makedirs("./dokumen_hasil", exist_ok=True)
+                    lokasi_simpan = f"./dokumen_hasil/{nama_unik}"
+                    
+                    # PERBAIKAN 3: Mode "Anti-Crash". Jika PDF gagal dibuat, jadikan file TXT biasa
+                    try:
+                        if nama_file_asli.lower().endswith('.pdf'):
+                            pdf = FPDF()
+                            pdf.add_page()
+                            pdf.set_font("Arial", size=11)
+                            
+                            # Abaikan karakter emoji/simbol aneh yang bikin PDF crash
+                            isi_teks_pdf = isi_teks.encode('latin-1', 'ignore').decode('latin-1')
+                            pdf.multi_cell(0, 7, txt=isi_teks_pdf)
+                            pdf.output(lokasi_simpan)
+                        else:
+                            with open(lokasi_simpan, "w", encoding="utf-8") as f:
+                                f.write(isi_teks)
+                                
+                        link_download = f"http://localhost:8000/api/generated/download/{nama_unik}"
+                        pesan_selesai = f"\n\n✨ **Selesai!** 📥 [**Unduh {nama_file_asli} di sini**]({link_download})"
+                        yield f"data: {json.dumps({'token': pesan_selesai})}\n\n"
+                        
+                    except Exception as e:
+                        # JIKA FPDF ERROR, OTOMATIS BIKIN TXT (Fallback)
+                        fallback_nama = f"Fallback_{uuid.uuid4().hex[:6]}.txt"
+                        fallback_lokasi = f"./dokumen_hasil/{fallback_nama}"
+                        
+                        with open(fallback_lokasi, "w", encoding="utf-8") as f:
+                            f.write(isi_teks)
+                            
+                        link_download = f"http://localhost:8000/api/generated/download/{fallback_nama}"
+                        pesan_fallback = f"\n\n⚠️ *(Gagal membuat PDF karena format tidak didukung, dialihkan ke Teks)*\n📥 [**Unduh Dokumen di sini**]({link_download})"
+                        yield f"data: {json.dumps({'token': pesan_fallback})}\n\n"
+                else:
+                    # Kalau AI ngaco banget balasannya
+                    pesan_gagal = "\n\n*(Sistem gagal mendeteksi format dokumen dari AI)*"
+                    yield f"data: {json.dumps({'token': pesan_gagal})}\n\n"
+
             yield "data: [DONE]\n\n"
         
         return StreamingResponse(generate(), media_type="text/event-stream")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+       
 # ==========================================
 # MODEL DATA & STORAGE UNTUK CHAT HISTORY
 # ==========================================
-import json
-import uuid
-from datetime import datetime
-
 CHAT_FILE = "./chat_history.json"
 
 class ChatMessage(BaseModel):
@@ -397,7 +523,6 @@ def _simpan_chat(data: list):
 # ==========================================
 # ENDPOINT 3: CHAT HISTORY
 # ==========================================
-
 @app.get("/api/chat/sessions")
 async def list_sessions():
     return _baca_chat()

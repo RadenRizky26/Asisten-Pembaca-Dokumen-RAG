@@ -322,7 +322,7 @@ export default function Home() {
         return cleanCited; // Fallback jika tidak ketemu
       };
 
-      processedText = teks.replace(/\(Sumber:\s*(.*?),\s*(?:halaman|hal)\s*([^)]+)\)/gi, (match, p1, p2) => {
+      processedText = teks.replace(/[[(]Sumber:\s*(.*?),\s*(?:halaman|hal)\s*([^)\]]+)[)\]]/gi, (match, p1, p2) => {
         const firstPageMatch = p2.match(/\d+/);
         const pageNum = firstPageMatch ? firstPageMatch[0] : "1";
         const cleanFileName = findRealFileName(p1);

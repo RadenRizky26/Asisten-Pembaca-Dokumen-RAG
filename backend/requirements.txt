@@ -4,8 +4,10 @@ langchain
 langchain-google-genai
 langchain-huggingface
 langchain-community
-chromadb
+langchain-postgres
+psycopg2-binary
 pypdf
+fpdf
 python-docx
 python-pptx
 openpyxl
