@@ -387,27 +387,31 @@ async def chat_ai_stream(pertanyaan: Pertanyaan):
             async for chunk in chain.astream({"context": full_context, "question": pertanyaan.teks}):
                 full_response += chunk
                 
-                # PERBAIKAN 1: Jadikan pengecekan Tidak Peduli Huruf Besar/Kecil
-                response_upper = full_response.upper()
-                
-                if "<NAMA_FILE>" in response_upper or "<ISI_DOKUMEN>" in response_upper:
-                    if not is_generating_file:
+                if not is_generating_file:
+                    # Gabung buffer + chunk untuk deteksi tag yang akurat
+                    combined = buffer_stream + chunk
+                    up = combined.upper()
+                    pos_nama = up.find("<NAMA_FILE>")
+                    pos_isi = up.find("<ISI_DOKUMEN>")
+                    
+                    if pos_nama >= 0 or pos_isi >= 0:
+                        # Tag ditemukan - cari posisi tag terawal
+                        tag_pos = len(combined)
+                        if pos_nama >= 0: tag_pos = min(tag_pos, pos_nama)
+                        if pos_isi >= 0:  tag_pos = min(tag_pos, pos_isi)
+                        
+                        # Kirim teks AMAN sebelum tag (tidak ada yg terpotong)
+                        safe_text = combined[:tag_pos]
+                        if safe_text:
+                            yield f"data: {json.dumps({'token': safe_text})}\n\n"
+                        
                         is_generating_file = True
-                        # Kirim sisa teks normal di buffer sebelum tag agar tidak terpotong
-                        if buffer_stream:
-                            last_angle = buffer_stream.rfind("<")
-                            if last_angle != -1:
-                                safe_text = buffer_stream[:last_angle]
-                                if safe_text:
-                                    yield f"data: {json.dumps({'token': safe_text})}\n\n"
-                            else:
-                                yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
-                            buffer_stream = ""
+                        buffer_stream = ""
                         pesan_tunggu = "\n\n*(Sedang menyusun dokumen, mohon tunggu...)*\n"
                         yield f"data: {json.dumps({'token': pesan_tunggu})}\n\n"
-                    continue 
-                
-                if not is_generating_file:
+                        continue
+                    
+                    # Tidak ada tag → streaming normal dengan buffer aman
                     buffer_stream += chunk
                     last_angle_idx = buffer_stream.rfind("<")
                     

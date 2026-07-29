@@ -72,9 +72,9 @@ export default function PDFPreview({ filename, pageNumber, onClose }: PDFPreview
             href={downloadUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 px-3 py-1 bg-[#f54e00]/15 hover:bg-[#f54e00]/25 text-[var(--color-primary)] rounded-full text-[12px] font-semibold border border-[#f54e00]/30 transition-all no-underline shadow-sm"
+            className="inline-block px-2.5 py-1 mx-1 mb-0.5 rounded-md text-[11px] font-bold font-sans tracking-wide align-middle bg-[var(--color-primary)] text-white border border-[var(--color-primary)]/20 shadow-sm cursor-pointer transition-colors no-underline"
           >
-            <DownloadSimple weight="bold" size={12} /> Unduh Dokumen
+            <DownloadSimple weight="bold" size={11} className="inline-block mr-1 align-middle" /> Unduh Dokumen
           </a>
         </div>
       </div>
@@ -92,10 +92,10 @@ export default function PDFPreview({ filename, pageNumber, onClose }: PDFPreview
           <div className="flex items-center gap-2">
             <a 
               href={downloadUrl} 
-              className="inline-flex items-center gap-1.5 px-3 py-1 bg-[#f54e00]/15 hover:bg-[#f54e00]/25 text-[var(--color-primary)] rounded-full text-[12px] font-semibold border border-[#f54e00]/30 transition-all no-underline shadow-sm" 
+              className="inline-block px-2.5 py-1 mx-1 mb-0.5 rounded-md text-[11px] font-bold font-sans tracking-wide align-middle bg-[var(--color-primary)] text-white border border-[var(--color-primary)]/20 shadow-sm cursor-pointer transition-colors no-underline" 
               download
             >
-              <DownloadSimple weight="bold" size={12} /> {filename}
+              <DownloadSimple weight="bold" size={11} className="inline-block mr-1 align-middle" /> {filename}
             </a>
             <button onClick={onClose} className="text-[var(--color-muted)] hover:text-[var(--color-primary)] hover:bg-[var(--color-hairline-soft)] p-1.5 rounded transition">
               <X size={18} weight="bold" />

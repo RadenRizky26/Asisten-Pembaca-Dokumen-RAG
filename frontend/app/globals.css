@@ -150,30 +150,34 @@ body {
   }
 }
 
-/* Styling otomatis untuk link unduhan agar berbentuk pill seperti tombol sitasi */
+/* Styling otomatis untuk link unduhan agar sama persis dengan tombol sitasi */
 a[href*="/api/generated/download/"],
 a[href*="/api/files/download/"] {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.25rem 0.75rem;
-  background-color: rgba(245, 78, 0, 0.15) !important;
-  color: var(--color-primary) !important;
-  border-radius: 9999px;
-  font-size: 13px;
-  font-weight: 600;
-  border: 1px solid rgba(245, 78, 0, 0.3) !important;
+  display: inline-block;
+  padding: 0.125rem 0.625rem;
+  margin: 0 0.25rem 0.125rem 0;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: var(--font-sans, system-ui, sans-serif);
+  letter-spacing: 0.05em;
+  vertical-align: middle;
+  background-color: var(--color-primary) !important;
+  color: #ffffff !important;
+  border: 1px solid rgba(245, 78, 0, 0.2) !important;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05) !important;
   text-decoration: none !important;
-  transition: all 0.2s;
-  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  transition: filter 0.2s, box-shadow 0.2s;
+  white-space: nowrap;
 }
 
 a[href*="/api/generated/download/"]:hover,
 a[href*="/api/files/download/"]:hover {
-  background-color: rgba(245, 78, 0, 0.25) !important;
+  filter: brightness(1.1);
+  box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.1) !important;
 }
 
 a[href*="/api/generated/download/"] strong,
 a[href*="/api/files/download/"] strong {
-  font-weight: 600;
+  font-weight: 700;
 }
