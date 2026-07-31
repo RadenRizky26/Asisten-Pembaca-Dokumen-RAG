@@ -307,12 +307,37 @@ export default function Home() {
           const data = await res.json();
           if (!res.ok) {
             reject(data.detail || "Terjadi kesalahan saat upload.");
-          } else {
-            setFile(null);
-            setFileInputKey((v) => v + 1);
-            fetchFiles();
-            resolve(`Dokumen "${file.name}" berhasil ditambahkan!`);
+            return;
           }
+
+          const namaFile = file.name;
+          const maxRetry = 300;
+          for (let i = 0; i < maxRetry; i++) {
+            await new Promise((r) => setTimeout(r, 2000));
+            try {
+              const statusRes = await fetch(
+                `${API}/api/upload/status/${encodeURIComponent(namaFile)}`,
+                { headers: authHeaders() }
+              );
+              if (statusRes.ok) {
+                const statusData = await statusRes.json();
+                if (statusData.status === "sukses") {
+                  setFile(null);
+                  setFileInputKey((v) => v + 1);
+                  fetchFiles();
+                  resolve(`Dokumen "${namaFile}" berhasil ditambahkan!`);
+                  return;
+                }
+                if (statusData.status === "error") {
+                  reject(statusData.detail || "Gagal memproses dokumen.");
+                  return;
+                }
+              }
+            } catch {
+              // backend mungkin sedang sibuk; lanjut polling
+            }
+          }
+          reject("Proses indeks terlalu lama. Coba lagi atau gunakan file yang lebih kecil.");
         } catch {
           reject("Gagal mengupload dokumen. Pastikan backend berjalan.");
         }

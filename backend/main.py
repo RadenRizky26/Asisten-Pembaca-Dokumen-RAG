@@ -4,7 +4,7 @@ import re
 import json
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -19,6 +19,11 @@ from auth import (
     get_optional_user, decode_token, UserPublic
 )
 from database.db import auto_claim_documents, auto_claim_chat_sessions, get_raw_connection
+
+def bersihkan_teks(teks: str) -> str:
+    if not teks:
+        return teks
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", teks)
 
 # Pustaka AI LangChain
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -78,6 +83,7 @@ template_instruksi = """
 
     JALUR KHUSUS A (PENGGUNA MEMINTA DOWNLOAD FILE ASLI):
     - HANYA aktif jika pengguna secara sadar mengetik: "minta file asli", "download dokumennya", "berikan file pdfnya".
+    - GANTI Nama_File_Asli.pdf dengan NAMA FILE PERSIS yang muncul di sitasi [Sumber: Nama_File.pdf, halaman X] pada jawabanmu (termasuk spasi, tanda baca, dan ekstensinya). JANGAN mengubah, menghapus, atau mengganti spasi dengan underscore.
     - Berikan tautan ini di akhir: 📥 [Unduh Nama_File_Asli.pdf](http://localhost:8000/api/files/download/Nama_File_Asli.pdf)
     - JIKA TIDAK DIMINTA, JANGAN BERIKAN LINK INI.
 
@@ -99,39 +105,20 @@ template_instruksi = """
 prompt = ChatPromptTemplate.from_template(template_instruksi)
 
 # ==========================================
-# ENDPOINT 1: UPLOAD DOKUMEN
+# ENDPOINT 1: UPLOAD DOKUMEN (ASYNC / BACKGROUND)
 # ==========================================
-@app.post("/api/upload")
-async def upload_dokumen(
-    file: UploadFile = File(...),
-    x_session_id: Optional[str] = Header(None),
-    authorization: Optional[str] = Header(None),
-):
-    if not os.path.exists("./kumpulan_dokumen"):
-        os.makedirs("./kumpulan_dokumen")
-        
-    filename = file.filename
-    file_path = f"./kumpulan_dokumen/{filename}"
+UPLOAD_STATUS = {}
 
-    user_id = None
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.replace("Bearer ", "")
-        payload = decode_token(token)
-        if payload:
-            user_id = payload.get("sub") or payload.get("id")
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    ekstensi = filename.lower().split('.')[-1]
-    documents = []
-    base_metadata = {"source": filename}
-    if user_id:
-        base_metadata["user_id"] = user_id
-    if x_session_id:
-        base_metadata["session_id"] = x_session_id
-    
+def _proses_dokumen(file_path: str, filename: str, user_id: Optional[str], x_session_id: Optional[str]):
     try:
+        ekstensi = filename.lower().split('.')[-1]
+        documents = []
+        base_metadata = {"source": filename}
+        if user_id:
+            base_metadata["user_id"] = user_id
+        if x_session_id:
+            base_metadata["session_id"] = x_session_id
+
         if ekstensi == "pdf":
             reader = PdfReader(file_path)
             for i, hal in enumerate(reader.pages):
@@ -171,25 +158,69 @@ async def upload_dokumen(
                         teks_dokumen += teks_baris + "\n"
             if teks_dokumen.strip():
                 documents.append(Document(page_content=teks_dokumen, metadata=dict(base_metadata)))
-        
-        if documents:
-            pemotong = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=400)
-            potongan = pemotong.split_documents(documents)
-            
-            for chunk in potongan:
-                page = chunk.metadata.get("page")
-                if page is not None:
-                    if "--- Halaman" not in chunk.page_content and "--- Slide" not in chunk.page_content:
-                        tipe = "Slide" if ekstensi == "pptx" else "Halaman"
-                        chunk.page_content = f"\n--- {tipe} {page} ---\n{chunk.page_content}"
-                        
-            get_vector_db().add_documents(potongan)
-            return {"status": "sukses", "pesan": f"{filename} berhasil diindeks!"}
-        else:
-            raise HTTPException(status_code=400, detail="Dokumen kosong atau tidak terbaca.")
-            
+
+        if not documents:
+            UPLOAD_STATUS[filename] = {"status": "error", "detail": "Dokumen kosong atau tidak terbaca."}
+            return
+
+        pemotong = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=400)
+        potongan = pemotong.split_documents(documents)
+
+        for chunk in potongan:
+            page = chunk.metadata.get("page")
+            if page is not None:
+                if "--- Halaman" not in chunk.page_content and "--- Slide" not in chunk.page_content:
+                    tipe = "Slide" if ekstensi == "pptx" else "Halaman"
+                    chunk.page_content = f"\n--- {tipe} {page} ---\n{chunk.page_content}"
+            chunk.page_content = bersihkan_teks(chunk.page_content)
+            chunk.metadata = {
+                k: (bersihkan_teks(v) if isinstance(v, str) else v)
+                for k, v in chunk.metadata.items()
+            }
+
+        get_vector_db().add_documents(potongan)
+        UPLOAD_STATUS[filename] = {"status": "sukses", "detail": f"{filename} berhasil diindeks!"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        UPLOAD_STATUS[filename] = {"status": "error", "detail": str(e)}
+
+@app.post("/api/upload")
+async def upload_dokumen(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+    x_session_id: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    if not os.path.exists("./kumpulan_dokumen"):
+        os.makedirs("./kumpulan_dokumen")
+
+    filename = file.filename
+    file_path = f"./kumpulan_dokumen/{filename}"
+
+    user_id = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.replace("Bearer ", "")
+        payload = decode_token(token)
+        if payload:
+            user_id = payload.get("sub") or payload.get("id")
+
+    # Simpan file dulu secara sinkron (cepat), lalu proses di background
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal menyimpan file: {str(e)}")
+
+    UPLOAD_STATUS[filename] = {"status": "proses", "detail": f"{filename} sedang diindeks..."}
+    background_tasks.add_task(_proses_dokumen, file_path, filename, user_id, x_session_id)
+
+    return {"status": "proses", "pesan": f"{filename} sedang diproses di background."}
+
+@app.get("/api/upload/status/{filename}")
+async def upload_status(filename: str):
+    status = UPLOAD_STATUS.get(filename)
+    if not status:
+        raise HTTPException(status_code=404, detail="Status tidak ditemukan.")
+    return status
         
 # ==========================================
 # ENDPOINT: MELIHAT & MENGHAPUS DOKUMEN
@@ -498,14 +529,42 @@ async def chat_ai(
 # ==========================================
 # ENDPOINT: DOWNLOAD FILE (ASLI & HASIL AI)
 # ==========================================
-@app.get("/api/files/download/{filename}")
-async def download_file(filename: str):
+def _normalisasi_nama(nama: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", nama.lower()).strip()
+
+def _resolve_file_path(filename: str, folder: str = "./kumpulan_dokumen") -> str:
+    """Menemukan path file di folder, toleran terhadap beda spasi/underscore/case."""
     import urllib.parse
     filename = urllib.parse.unquote(filename)
-    file_path = os.path.join("./kumpulan_dokumen", filename)
+    folder_abs = os.path.abspath(folder)
+    exact = os.path.join(folder_abs, filename)
+    if os.path.exists(exact):
+        return exact
+
+    target = _normalisasi_nama(filename)
+    if not target:
+        return exact
+
+    semua = [n for n in os.listdir(folder_abs) if os.path.isfile(os.path.join(folder_abs, n))]
+    cocok = [n for n in semua if _normalisasi_nama(n) == target]
+    if len(cocok) == 1:
+        return os.path.join(folder_abs, cocok[0])
+    if len(cocok) > 1:
+        return os.path.join(folder_abs, min(cocok, key=lambda n: len(n)))
+
+    parsial = [n for n in semua if target in _normalisasi_nama(n) or _normalisasi_nama(n) in target]
+    if parsial:
+        return os.path.join(folder_abs, min(parsial, key=lambda n: len(n)))
+
+    return exact
+
+# ==========================================
+@app.get("/api/files/download/{filename}")
+async def download_file(filename: str):
+    file_path = _resolve_file_path(filename, "./kumpulan_dokumen")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
-    return FileResponse(file_path)
+    return FileResponse(file_path, filename=os.path.basename(file_path))
 
 @app.get("/api/generated/download/{filename}")
 async def download_generated_file(filename: str):
@@ -518,14 +577,12 @@ async def download_generated_file(filename: str):
 
 @app.get("/api/files/preview/{filename}")
 async def preview_file(filename: str):
-    import urllib.parse
-    filename = urllib.parse.unquote(filename)
-    
-    file_path = os.path.abspath(os.path.join("./kumpulan_dokumen", filename))
+    file_path = _resolve_file_path(filename, "./kumpulan_dokumen")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
         
-    ekstensi = filename.lower().split('.')[-1]
+    nama_disk = os.path.basename(file_path)
+    ekstensi = nama_disk.lower().split('.')[-1]
     if ekstensi == "pdf":
         return FileResponse(file_path)
         
@@ -533,7 +590,7 @@ async def preview_file(filename: str):
     if not os.path.exists(preview_dir):
         os.makedirs(preview_dir)
         
-    pdf_filename = f"{filename}.pdf"
+    pdf_filename = f"{nama_disk}.pdf"
     pdf_path = os.path.join(preview_dir, pdf_filename)
     
     if os.path.exists(pdf_path):
