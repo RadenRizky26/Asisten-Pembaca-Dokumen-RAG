@@ -1,10 +1,7 @@
 @import "tailwindcss";
-
-/* Tailwind v4: arahkan varian `dark:` ke class `.dark` (bukan prefers-color-scheme) */
-@custom-variant dark (&:where(.dark, .dark *));
+@import "katex/dist/katex.min.css";
 
 @theme {
-  /* ── Color Tokens (Light) ── */
   --color-canvas: #fafafa;
   --color-canvas-soft: #f4f4f5;
   --color-surface-sidebar: #ffffff;
@@ -124,6 +121,9 @@
     to { transform: translateX(calc(-100% - var(--gap))); }
   }
 }
+
+/* Tailwind v4: arahkan varian `dark:` ke class `.dark` (bukan prefers-color-scheme) */
+@custom-variant dark (&:where(.dark, .dark *));
 
 /* BorderBeam: registrasi custom property agar sudut bisa di-animasi halus */
 @property --border-beam-angle {
@@ -383,4 +383,27 @@ a[href*="/api/files/download/"]:hover {
 a[href*="/api/generated/download/"] strong,
 a[href*="/api/files/download/"] strong {
   font-weight: 700;
+}
+
+/* KaTeX styling untuk rumus matematika - Highlight blok */
+.katex {
+  font-size: 1.1em;
+  padding: 0.2em 0.4em;
+  margin: 0 0.1em;
+  background-color: var(--color-surface-strong);
+  border-radius: 6px;
+  border: 1px solid var(--color-hairline-strong);
+  color: var(--color-primary);
+  display: inline-block;
+  vertical-align: middle;
+}
+
+/* Membedakan rumus blok (display) dengan margin lebih jelas */
+.katex-display {
+  padding: 1em;
+  margin: 1em 0;
+  background-color: var(--color-canvas-soft);
+  border: 1px solid var(--color-hairline-strong);
+  border-radius: 10px;
+  overflow-x: auto;
 }

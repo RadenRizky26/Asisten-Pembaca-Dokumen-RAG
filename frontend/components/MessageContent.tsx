@@ -61,6 +61,10 @@ export function MessageContent({
     );
   }
 
+  // Sembunyikan tag XML pembuatan dokumen dari chat (karena di-handle backend)
+  processedText = processedText.replace(/<NAMA_FILE>.*?<\/NAMA_FILE>/gs, "");
+  processedText = processedText.replace(/<ISI_DOKUMEN>.*?<\/ISI_DOKUMEN>/gs, "");
+
   return (
     <div
       className={`markdown-body text-body-md text-body leading-[1.75] ${

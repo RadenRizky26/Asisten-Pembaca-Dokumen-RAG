@@ -74,8 +74,13 @@ template_instruksi = """
     Konteks dokumen di bawah ini telah dilengkapi dengan metadata [Sumber: Nama_File, halaman X].
 
     ATURAN DASAR MENJAWAB (PERTANYAAN BIASA):
-    1. Jawablah pertanyaan pengguna dengan SANGAT DETAIL dan akurat berdasarkan konteks.
-    2. SITASI ADALAH KEWAJIBAN MUTLAK! Setiap kali kamu menuliskan fakta, pasal, penjelasan, atau data dari dokumen, kamu WAJIB menempelkan sitasi tepat di ujung kalimat tersebut.
+    1. Jawablah pertanyaan pengguna dengan bahasa yang ramah, santai, dan sangat mudah dipahami (seperti menjelaskan kepada teman atau orang awam), tanpa jargon teknis yang membingungkan.
+    2. Jika pengguna menanyakan rumus atau istilah teknis yang rumit, berikan analogi atau perumpamaan sederhana agar lebih mudah dimengerti. 
+    3. DILARANG menduplikasi penulisan variabel teknis. Sajikan dengan format yang bersih dan rapi.
+    4. SITASI ADALAH KEWAJIBAN MUTLAK! Setiap kali kamu menuliskan fakta atau data dari dokumen, kamu WAJIB menempelkan sitasi tepat di ujung kalimat tersebut dalam format: **[Sumber: Nama_File.pdf, halaman X]**.
+    5. JAWAB HANYA BERDASARKAN KONTEKS! Jika jawaban tidak ditemukan di dokumen, katakan dengan sopan: "Maaf, saya tidak menemukan informasi tersebut di dalam dokumen yang Anda berikan." DILARANG mengarang jawaban dari pengetahuan umum.
+    6. Gunakan format LaTeX ($...$) untuk rumus agar terlihat profesional dan rapi.
+
        -> Format Sitasi yang Wajib (Inline Citation): **[Sumber: Nama_File.pdf, halaman X]**
        -> Contoh penulisan: "...diancam dengan pidana penjara paling lama sembilan tahun [Sumber: KUHP.pdf, halaman 89]."
        -> DILARANG membuat daftar pustaka terpisah di bawah. Sitasi harus menyatu di dalam paragraf/poin.
@@ -475,11 +480,15 @@ async def chat_ai(
         filter_dict = _build_user_filter(pertanyaan.selected_files, user_payload, x_session_id)
                 
         if filter_dict:
-            dokumen_relevan = get_vector_db().similarity_search(query=pertanyaan.teks, k=k_val, filter=filter_dict)
+            vector_results = get_vector_db().similarity_search(query=pertanyaan.teks, k=k_val * 3, filter=filter_dict)
+            re_ranked = re_rank(pertanyaan.teks, vector_results, k=k_val)
+            dokumen_relevan = re_ranked
         else:
-            retriever_dynamic = get_vector_db().as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
-            dokumen_relevan = retriever_dynamic.invoke(pertanyaan.teks)
-        
+            retriever_dynamic = get_vector_db().as_retriever(search_type="mmr", search_kwargs={"k": k_val * 3, "fetch_k": k_val * 6})
+            vector_results = retriever_dynamic.invoke(pertanyaan.teks)
+            re_ranked = re_rank(pertanyaan.teks, vector_results, k=k_val)
+            dokumen_relevan = re_ranked
+
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )
@@ -528,8 +537,27 @@ async def chat_ai(
 
 # ==========================================
 # ENDPOINT: DOWNLOAD FILE (ASLI & HASIL AI)
-# ==========================================
-def _normalisasi_nama(nama: str) -> str:
+import logging
+
+# Setup Logging
+logging.basicConfig(
+    filename='rag_performance.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s'
+)
+
+
+def re_rank(query: str, documents: List[Document], k: int = 3) -> List[Document]:
+    if not documents:
+        return []
+    
+    pairs = [(query, doc.page_content) for doc in documents]
+    scores = reranker.predict(pairs)
+    
+    # Urutkan berdasarkan skor re-ranker
+    scored_docs = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
+    return [doc for score, doc in scored_docs[:k]]
+
     return re.sub(r"[^a-z0-9]+", " ", nama.lower()).strip()
 
 def _resolve_file_path(filename: str, folder: str = "./kumpulan_dokumen") -> str:
@@ -649,11 +677,20 @@ async def chat_ai_stream(
 
         filter_dict = _build_user_filter(pertanyaan.selected_files, user_payload, x_session_id)
                 
+        # Inisialisasi variabel untuk diakses di generate()
+        vector_results = []
+        dokumen_relevan = []
+        corrected = False
+
+        filter_dict = _build_user_filter(pertanyaan.selected_files, user_payload, x_session_id)
+                
         if filter_dict:
-            dokumen_relevan = get_vector_db().similarity_search(query=pertanyaan.teks, k=k_val, filter=filter_dict)
+            vector_results = get_vector_db().similarity_search(query=pertanyaan.teks, k=k_val, filter=filter_dict)
+            dokumen_relevan = vector_results
         else:
             retriever_dynamic = get_vector_db().as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
-            dokumen_relevan = retriever_dynamic.invoke(pertanyaan.teks)
+            vector_results = retriever_dynamic.invoke(pertanyaan.teks)
+            dokumen_relevan = vector_results
             
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
@@ -662,62 +699,39 @@ async def chat_ai_stream(
         history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in pertanyaan.history[-6:]]) if pertanyaan.history else ""
         full_context = f"History:\n{history_text}\n\nKonteks Dokumen:\n{konteks_dengan_sumber}"
         
+        # Panggil LLM untuk jawaban
         chain = prompt | current_llm | StrOutputParser()
         
         async def generate():
             import json, re
-            full_response = ""
-            is_generating_file = False
-            buffer_stream = "" 
+            full_response = await chain.ainvoke({"context": full_context, "question": pertanyaan.teks})
             
-            async for chunk in chain.astream({"context": full_context, "question": pertanyaan.teks}):
-                full_response += chunk
-                
-                if not is_generating_file:
-                    # Gabung buffer + chunk untuk deteksi tag yang akurat
-                    combined = buffer_stream + chunk
-                    up = combined.upper()
-                    pos_nama = up.find("<NAMA_FILE>")
-                    pos_isi = up.find("<ISI_DOKUMEN>")
-                    
-                    if pos_nama >= 0 or pos_isi >= 0:
-                        # Tag ditemukan - cari posisi tag terawal
-                        tag_pos = len(combined)
-                        if pos_nama >= 0: tag_pos = min(tag_pos, pos_nama)
-                        if pos_isi >= 0:  tag_pos = min(tag_pos, pos_isi)
-                        
-                        # Kirim teks AMAN sebelum tag (tidak ada yg terpotong)
-                        safe_text = combined[:tag_pos]
-                        if safe_text:
-                            yield f"data: {json.dumps({'token': safe_text})}\n\n"
-                        
-                        is_generating_file = True
-                        buffer_stream = ""
-                        pesan_tunggu = "\n\n*(Sedang menyusun dokumen, mohon tunggu...)*\n"
-                        yield f"data: {json.dumps({'token': pesan_tunggu})}\n\n"
-                        continue
-                    
-                    # Tidak ada tag → streaming normal dengan buffer aman
-                    buffer_stream += chunk
-                    last_angle_idx = buffer_stream.rfind("<")
-                    
-                    if last_angle_idx != -1:
-                        potential_tag = buffer_stream[last_angle_idx:].upper()
-                        if "<NAMA_FILE>".startswith(potential_tag) or "<ISI_DOKUMEN>".startswith(potential_tag):
-                            safe_text = buffer_stream[:last_angle_idx]
-                            if safe_text:
-                                yield f"data: {json.dumps({'token': safe_text})}\n\n"
-                            buffer_stream = buffer_stream[last_angle_idx:] 
-                        else:
-                            yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
-                            buffer_stream = ""
-                    else:
-                        yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
-                        buffer_stream = ""
+            # Self-Correction Loop: Verifikasi sitasi
+            is_corrected = False
+            if "[Sumber:" not in full_response:
+                correction_prompt = ChatPromptTemplate.from_template(
+                    "Jawaban ini tidak mengandung sitasi. Tolong susun ulang jawaban berikut dengan sitasi berdasarkan konteks.\n\nKonteks: {context}\n\nJawaban awal: {jawaban}"
+                )
+                correction_chain = correction_prompt | current_llm | StrOutputParser()
+                full_response = await correction_chain.ainvoke({"context": full_context, "jawaban": full_response})
+                is_corrected = True
 
-            if buffer_stream and not is_generating_file:
-                yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
+            # Deteksi pembuatan dokumen
+            is_generating_file = False
+            match_isi = re.search(r"<ISI_DOKUMEN>(.*?)(?:</ISI_DOKUMEN>|$)", full_response, re.DOTALL | re.IGNORECASE)
+            match_nama = re.search(r"<NAMA_FILE>(.*?)</NAMA_FILE>", full_response, re.IGNORECASE)
+            
+            chat_text = full_response
+            if match_isi and match_nama:
+                is_generating_file = True
+                # Bersihkan chat_text dari tag XML sebelum distream ke user
+                chat_text = re.sub(r"<NAMA_FILE>.*?</NAMA_FILE>", "", chat_text, flags=re.IGNORECASE | re.DOTALL)
+                chat_text = re.sub(r"<ISI_DOKUMEN>.*?(?:</ISI_DOKUMEN>|$)", "", chat_text, flags=re.IGNORECASE | re.DOTALL)
 
+            # Streaming response murni tanpa tag XML
+            for token in chat_text:
+                yield f"data: {json.dumps({'token': token})}\n\n"
+            
             # ---------------------------------------------------------
             # PROSES PEMBUATAN FILE FISIK SETELAH STREAMING SELESAI
             # ---------------------------------------------------------
@@ -740,36 +754,29 @@ async def chat_ai_stream(
                     os.makedirs("./dokumen_hasil", exist_ok=True)
                     lokasi_simpan = f"./dokumen_hasil/{nama_unik}"
                     
-                    # PERBAIKAN 3: Mode "Anti-Crash". Jika PDF gagal dibuat, jadikan file TXT biasa
+                    # PERBAIKAN: Jika PDF gagal dibuat, gunakan TXT dengan ekstensi TXT
                     try:
-                        if nama_file_asli.lower().endswith('.pdf'):
-                            pdf = FPDF()
-                            pdf.add_page()
-                            pdf.set_font("Arial", size=11)
-                            
-                            # Abaikan karakter emoji/simbol aneh yang bikin PDF crash
-                            isi_teks_pdf = isi_teks.encode('latin-1', 'ignore').decode('latin-1')
-                            pdf.multi_cell(0, 7, txt=isi_teks_pdf)
-                            pdf.output(lokasi_simpan)
-                        else:
-                            with open(lokasi_simpan, "w", encoding="utf-8") as f:
-                                f.write(isi_teks)
-                                
-                        link_download = f"http://localhost:8000/api/generated/download/{nama_unik}"
-                        pesan_selesai = f"\n\n✨ **Selesai!** 📥 [**Unduh {nama_file_asli} di sini**]({link_download})"
-                        yield f"data: {json.dumps({'token': pesan_selesai})}\n\n"
-                        
+                        # Coba buat PDF
+                        pdf = FPDF()
+                        pdf.add_page()
+                        pdf.set_font("Arial", size=11)
+                        # Sanitasi teks agar aman untuk FPDF (Latin-1)
+                        isi_teks_pdf = isi_teks.encode('latin-1', 'ignore').decode('latin-1')
+                        pdf.multi_cell(0, 7, txt=isi_teks_pdf)
+                        pdf.output(lokasi_simpan)
+                        final_filename = nama_file_asli
                     except Exception as e:
-                        # JIKA FPDF ERROR, OTOMATIS BIKIN TXT (Fallback)
-                        fallback_nama = f"Fallback_{uuid.uuid4().hex[:6]}.txt"
-                        fallback_lokasi = f"./dokumen_hasil/{fallback_nama}"
-                        
-                        with open(fallback_lokasi, "w", encoding="utf-8") as f:
+                        # Fallback ke TXT jika PDF gagal
+                        print(f"Gagal membuat PDF, fallback ke TXT: {e}")
+                        txt_path = lokasi_simpan.replace(".pdf", ".txt")
+                        with open(txt_path, "w", encoding="utf-8") as f:
                             f.write(isi_teks)
-                            
-                        link_download = f"http://localhost:8000/api/generated/download/{fallback_nama}"
-                        pesan_fallback = f"\n\n⚠️ *(Gagal membuat PDF karena format tidak didukung, dialihkan ke Teks)*\n📥 [**Unduh Dokumen di sini**]({link_download})"
-                        yield f"data: {json.dumps({'token': pesan_fallback})}\n\n"
+                        lokasi_simpan = txt_path
+                        final_filename = nama_file_asli.replace(".pdf", ".txt")
+                        
+                    link_download = f"http://localhost:8000/api/generated/download/{os.path.basename(lokasi_simpan)}"
+                    pesan_selesai = f"\n\n✨ **Selesai!** 📥 [**Unduh {final_filename} di sini**]({link_download})"
+                    yield f"data: {json.dumps({'token': pesan_selesai})}\n\n"
                 else:
                     # Kalau AI ngaco banget balasannya
                     pesan_gagal = "\n\n*(Sistem gagal mendeteksi format dokumen dari AI)*"

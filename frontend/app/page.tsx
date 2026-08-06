@@ -30,6 +30,7 @@ interface Message {
 export default function Home() {
   const [pertanyaan, setPertanyaan] = useState("");
   const [chat, setChat] = useState<Message[]>([]);
+  const [promptHistory, setPromptHistory] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -198,6 +199,8 @@ export default function Home() {
         }),
         signal: controller.signal,
       });
+
+      setPromptHistory((prev) => [...prev, pesanUser.content]);
 
       if (!res.ok) throw new Error("Server error");
 
@@ -484,6 +487,7 @@ export default function Home() {
           onSend={kirimPesan}
           onStop={() => abortController?.abort()}
           loading={loading}
+          promptHistory={promptHistory}
         />
       </main>
 

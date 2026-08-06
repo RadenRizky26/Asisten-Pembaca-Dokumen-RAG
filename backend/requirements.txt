@@ -17,3 +17,5 @@ httpx
 pyjwt
 passlib[bcrypt]
 python-multipart
+rank_bm25
+sentence-transformers
