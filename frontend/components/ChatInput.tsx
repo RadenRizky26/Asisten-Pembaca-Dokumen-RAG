@@ -64,7 +64,7 @@ export function ChatInput({
     <div className="px-4 pb-4 pt-2 md:pb-6">
       <div className="mx-auto max-w-[760px]">
         <div className="relative rounded-2xl">
-          <div className="flex items-end gap-2 rounded-2xl border border-hairline bg-surface-card px-3.5 py-2.5 shadow-sm transition-shadow focus-within:!border-transparent focus-within:!ring-0 focus-within:shadow-md">
+          <div className="flex items-end gap-2 rounded-2xl border border-hairline bg-surface-card dark:bg-[#161618] px-3.5 py-2.5 shadow-sm transition-shadow focus-within:!border-transparent focus-within:!ring-0 focus-within:shadow-md">
             <textarea
               ref={textareaRef}
               value={pertanyaan}
@@ -73,7 +73,7 @@ export function ChatInput({
               rows={1}
               placeholder="Tanyakan sesuatu dari dokumenmu..."
               disabled={disabled}
-              className="min-h-[24px] flex-1 resize-none bg-transparent py-1.5 text-[15px] leading-6 text-ink placeholder:text-muted focus:!outline-none focus:!ring-0 disabled:opacity-50 max-h-[200px]"
+              className="min-h-[24px] flex-1 resize-none bg-transparent py-1.5 text-[15px] leading-6 text-ink dark:text-gray-100 placeholder:text-muted focus:!outline-none focus:!ring-0 disabled:opacity-50 max-h-[200px]"
             />
             <button
               type="button"

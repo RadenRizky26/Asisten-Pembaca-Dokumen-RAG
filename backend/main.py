@@ -80,15 +80,10 @@ template_instruksi = """
     4. SITASI ADALAH KEWAJIBAN MUTLAK! Setiap kali kamu menuliskan fakta atau data dari dokumen, kamu WAJIB menempelkan sitasi tepat di ujung kalimat tersebut dalam format: **[Sumber: Nama_File.pdf, halaman X]**.
     5. JAWAB HANYA BERDASARKAN KONTEKS! Jika jawaban tidak ditemukan di dokumen, katakan dengan sopan: "Maaf, saya tidak menemukan informasi tersebut di dalam dokumen yang Anda berikan." DILARANG mengarang jawaban dari pengetahuan umum.
     6. Gunakan format LaTeX ($...$) untuk rumus agar terlihat profesional dan rapi.
-
-       -> Format Sitasi yang Wajib (Inline Citation): **[Sumber: Nama_File.pdf, halaman X]**
-       -> Contoh penulisan: "...diancam dengan pidana penjara paling lama sembilan tahun [Sumber: KUHP.pdf, halaman 89]."
-       -> DILARANG membuat daftar pustaka terpisah di bawah. Sitasi harus menyatu di dalam paragraf/poin.
-    3. JIKA pengguna HANYA BERTANYA (tidak meminta file), JAWABLAH SEPERTI BIASA. DILARANG KERAS memberikan tombol unduhan, link download, atau membuat tag dokumen di akhir jawabanmu.
+    7. PENGECUALIAN UNTUK ATURAN 4 & 5: Jika pengguna HANYA meminta link download/dokumen asli tanpa menanyakan informasi teknis, abaikan aturan sitasi. Langsung berikan link unduhannya.
 
     JALUR KHUSUS A (PENGGUNA MEMINTA DOWNLOAD FILE ASLI):
-    - HANYA aktif jika pengguna secara sadar mengetik: "minta file asli", "download dokumennya", "berikan file pdfnya".
-    - GANTI Nama_File_Asli.pdf dengan NAMA FILE PERSIS yang muncul di sitasi [Sumber: Nama_File.pdf, halaman X] pada jawabanmu (termasuk spasi, tanda baca, dan ekstensinya). JANGAN mengubah, menghapus, atau mengganti spasi dengan underscore.
+    - HANYA aktif jika pengguna secara sadar mengetik: "minta file asli", "download dokumennya", "berikan filenya", "kirim dokumen", "kirimkan dokumen asli".
     - Berikan tautan ini di akhir: 📥 [Unduh Nama_File_Asli.pdf](http://localhost:8000/api/files/download/Nama_File_Asli.pdf)
     - JIKA TIDAK DIMINTA, JANGAN BERIKAN LINK INI.
 
@@ -287,10 +282,20 @@ async def hapus_dokumen(filename: str):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
     try:
         os.remove(file_path)
+        # PERBAIKAN: Hapus dari database vektor agar AI "lupa"
         try:
-            get_vector_db().delete(where={"source": filename})
-        except:
-            pass
+            conn = get_raw_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM langchain_pg_embedding WHERE cmetadata->>'source' = %s",
+                (filename,)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as db_err:
+            print(f"Gagal menghapus vektor dari database: {db_err}")
+            
         return {"status": "sukses", "pesan": f"{filename} dihapus!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -560,6 +565,10 @@ def re_rank(query: str, documents: List[Document], k: int = 3) -> List[Document]
 
     return re.sub(r"[^a-z0-9]+", " ", nama.lower()).strip()
 
+def _normalisasi_nama(nama: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+", " ", nama.lower()).strip()
+
 def _resolve_file_path(filename: str, folder: str = "./kumpulan_dokumen") -> str:
     """Menemukan path file di folder, toleran terhadap beda spasi/underscore/case."""
     import urllib.parse
@@ -706,9 +715,15 @@ async def chat_ai_stream(
             import json, re
             full_response = await chain.ainvoke({"context": full_context, "question": pertanyaan.teks})
             
-            # Self-Correction Loop: Verifikasi sitasi
+            # Cek apakah ini permintaan download file
+            is_download_request = "/api/files/download/" in full_response
+            
+            # Self-Correction Loop: Verifikasi sitasi (Bypass jika request download atau penolakan konteks)
             is_corrected = False
-            if "[Sumber:" not in full_response:
+            # Deteksi apakah AI menjawab tidak tahu atau informasi tidak ada
+            is_reject_response = "maaf" in full_response.lower() and ("tidak menemukan" in full_response.lower() or "tidak terdapat" in full_response.lower())
+            
+            if not is_download_request and not is_reject_response and "[Sumber:" not in full_response:
                 correction_prompt = ChatPromptTemplate.from_template(
                     "Jawaban ini tidak mengandung sitasi. Tolong susun ulang jawaban berikut dengan sitasi berdasarkan konteks.\n\nKonteks: {context}\n\nJawaban awal: {jawaban}"
                 )
