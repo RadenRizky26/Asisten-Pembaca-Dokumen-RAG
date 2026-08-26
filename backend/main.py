@@ -4,7 +4,7 @@ import re
 import json
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -13,6 +13,17 @@ from typing import List, Optional
 
 import comtypes.client
 import pythoncom
+
+from auth import (
+    hash_password, verify_password, create_access_token,
+    get_optional_user, decode_token, UserPublic
+)
+from database.db import auto_claim_documents, auto_claim_chat_sessions, get_raw_connection
+
+def bersihkan_teks(teks: str) -> str:
+    if not teks:
+        return teks
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", teks)
 
 # Pustaka AI LangChain
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -42,18 +53,20 @@ app.add_middleware(
 )
 
 # ==========================================
-# INISIALISASI AI & DATABASE
+# INISIALISASI AI & DATABASE (LAZY)
 # ==========================================
 load_dotenv()
-embeddings = HuggingFaceEmbeddings(model_name="paraphrase-multilingual-MiniLM-L12-v2")
-vektor_db = PGVector(
-    embeddings=embeddings,
-    collection_name="dokumen_rag",
-    connection=os.getenv("DATABASE_URL"),
-    use_jsonb=True,
-)
-retriever = vektor_db.as_retriever(search_kwargs={"k": 5})
-llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0.5)
+
+def get_vector_db():
+    if not hasattr(get_vector_db, "_instance"):
+        embeddings = HuggingFaceEmbeddings(model_name="paraphrase-multilingual-MiniLM-L12-v2")
+        get_vector_db._instance = PGVector(
+            embeddings=embeddings,
+            collection_name="dokumen_rag",
+            connection=os.getenv("DATABASE_URL"),
+            use_jsonb=True,
+        )
+    return get_vector_db._instance
 
 # --- PERBAIKAN: INSTRUKSI PROMPT YANG SANGAT KETAT ---
 template_instruksi = """
@@ -61,15 +74,16 @@ template_instruksi = """
     Konteks dokumen di bawah ini telah dilengkapi dengan metadata [Sumber: Nama_File, halaman X].
 
     ATURAN DASAR MENJAWAB (PERTANYAAN BIASA):
-    1. Jawablah pertanyaan pengguna dengan SANGAT DETAIL dan akurat berdasarkan konteks.
-    2. SITASI ADALAH KEWAJIBAN MUTLAK! Setiap kali kamu menuliskan fakta, pasal, penjelasan, atau data dari dokumen, kamu WAJIB menempelkan sitasi tepat di ujung kalimat tersebut.
-       -> Format Sitasi yang Wajib (Inline Citation): **[Sumber: Nama_File.pdf, halaman X]**
-       -> Contoh penulisan: "...diancam dengan pidana penjara paling lama sembilan tahun [Sumber: KUHP.pdf, halaman 89]."
-       -> DILARANG membuat daftar pustaka terpisah di bawah. Sitasi harus menyatu di dalam paragraf/poin.
-    3. JIKA pengguna HANYA BERTANYA (tidak meminta file), JAWABLAH SEPERTI BIASA. DILARANG KERAS memberikan tombol unduhan, link download, atau membuat tag dokumen di akhir jawabanmu.
+    1. Jawablah pertanyaan pengguna dengan bahasa yang ramah, santai, dan sangat mudah dipahami (seperti menjelaskan kepada teman atau orang awam), tanpa jargon teknis yang membingungkan.
+    2. Jika pengguna menanyakan rumus atau istilah teknis yang rumit, berikan analogi atau perumpamaan sederhana agar lebih mudah dimengerti. 
+    3. DILARANG menduplikasi penulisan variabel teknis. Sajikan dengan format yang bersih dan rapi.
+    4. SITASI ADALAH KEWAJIBAN MUTLAK! Setiap kali kamu menuliskan fakta atau data dari dokumen, kamu WAJIB menempelkan sitasi tepat di ujung kalimat tersebut dalam format: **[Sumber: Nama_File.pdf, halaman X]**.
+    5. JAWAB HANYA BERDASARKAN KONTEKS! Jika jawaban tidak ditemukan di dokumen, katakan dengan sopan: "Maaf, saya tidak menemukan informasi tersebut di dalam dokumen yang Anda berikan." DILARANG mengarang jawaban dari pengetahuan umum.
+    6. Gunakan format LaTeX ($...$) untuk rumus agar terlihat profesional dan rapi.
+    7. PENGECUALIAN UNTUK ATURAN 4 & 5: Jika pengguna HANYA meminta link download/dokumen asli tanpa menanyakan informasi teknis, abaikan aturan sitasi. Langsung berikan link unduhannya.
 
     JALUR KHUSUS A (PENGGUNA MEMINTA DOWNLOAD FILE ASLI):
-    - HANYA aktif jika pengguna secara sadar mengetik: "minta file asli", "download dokumennya", "berikan file pdfnya".
+    - HANYA aktif jika pengguna secara sadar mengetik: "minta file asli", "download dokumennya", "berikan filenya", "kirim dokumen", "kirimkan dokumen asli".
     - Berikan tautan ini di akhir: 📥 [Unduh Nama_File_Asli.pdf](http://localhost:8000/api/files/download/Nama_File_Asli.pdf)
     - JIKA TIDAK DIMINTA, JANGAN BERIKAN LINK INI.
 
@@ -91,23 +105,20 @@ template_instruksi = """
 prompt = ChatPromptTemplate.from_template(template_instruksi)
 
 # ==========================================
-# ENDPOINT 1: UPLOAD DOKUMEN
+# ENDPOINT 1: UPLOAD DOKUMEN (ASYNC / BACKGROUND)
 # ==========================================
-@app.post("/api/upload")
-async def upload_dokumen(file: UploadFile = File(...)):
-    if not os.path.exists("./kumpulan_dokumen"):
-        os.makedirs("./kumpulan_dokumen")
-        
-    filename = file.filename
-    file_path = f"./kumpulan_dokumen/{filename}"
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    ekstensi = filename.lower().split('.')[-1]
-    documents = []
-    
+UPLOAD_STATUS = {}
+
+def _proses_dokumen(file_path: str, filename: str, user_id: Optional[str], x_session_id: Optional[str]):
     try:
+        ekstensi = filename.lower().split('.')[-1]
+        documents = []
+        base_metadata = {"source": filename}
+        if user_id:
+            base_metadata["user_id"] = user_id
+        if x_session_id:
+            base_metadata["session_id"] = x_session_id
+
         if ekstensi == "pdf":
             reader = PdfReader(file_path)
             for i, hal in enumerate(reader.pages):
@@ -115,12 +126,13 @@ async def upload_dokumen(file: UploadFile = File(...)):
                 t = hal.extract_text()
                 if t:
                     page_text = f"\n--- Halaman {page_num} ---\n{t}"
-                    documents.append(Document(page_content=page_text, metadata={"source": filename, "page": page_num}))
+                    meta = {**base_metadata, "page": page_num}
+                    documents.append(Document(page_content=page_text, metadata=meta))
         elif ekstensi == "docx":
             doc = docx.Document(file_path)
             teks_dokumen = "\n".join([p.text for p in doc.paragraphs])
             if teks_dokumen.strip():
-                documents.append(Document(page_content=teks_dokumen, metadata={"source": filename}))
+                documents.append(Document(page_content=teks_dokumen, metadata=dict(base_metadata)))
         elif ekstensi == "pptx":
             prs = Presentation(file_path)
             for i, slide in enumerate(prs.slides):
@@ -132,7 +144,8 @@ async def upload_dokumen(file: UploadFile = File(...)):
                         slide_text += shape.text + "\n"
                         has_text = True
                 if has_text:
-                    documents.append(Document(page_content=slide_text, metadata={"source": filename, "page": slide_num}))
+                    meta = {**base_metadata, "page": slide_num}
+                    documents.append(Document(page_content=slide_text, metadata=meta))
         elif ekstensi == "xlsx":
             wb = openpyxl.load_workbook(file_path, data_only=True)
             teks_dokumen = ""
@@ -144,36 +157,120 @@ async def upload_dokumen(file: UploadFile = File(...)):
                     if teks_baris.strip(): 
                         teks_dokumen += teks_baris + "\n"
             if teks_dokumen.strip():
-                documents.append(Document(page_content=teks_dokumen, metadata={"source": filename}))
-        
-        if documents:
-            pemotong = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=400)
-            potongan = pemotong.split_documents(documents)
-            
-            for chunk in potongan:
-                page = chunk.metadata.get("page")
-                if page is not None:
-                    if "--- Halaman" not in chunk.page_content and "--- Slide" not in chunk.page_content:
-                        tipe = "Slide" if ekstensi == "pptx" else "Halaman"
-                        chunk.page_content = f"\n--- {tipe} {page} ---\n{chunk.page_content}"
-                        
-            vektor_db.add_documents(potongan)
-            return {"status": "sukses", "pesan": f"{filename} berhasil diindeks!"}
-        else:
-            raise HTTPException(status_code=400, detail="Dokumen kosong atau tidak terbaca.")
-            
+                documents.append(Document(page_content=teks_dokumen, metadata=dict(base_metadata)))
+
+        if not documents:
+            UPLOAD_STATUS[filename] = {"status": "error", "detail": "Dokumen kosong atau tidak terbaca."}
+            return
+
+        pemotong = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=400)
+        potongan = pemotong.split_documents(documents)
+
+        for chunk in potongan:
+            page = chunk.metadata.get("page")
+            if page is not None:
+                if "--- Halaman" not in chunk.page_content and "--- Slide" not in chunk.page_content:
+                    tipe = "Slide" if ekstensi == "pptx" else "Halaman"
+                    chunk.page_content = f"\n--- {tipe} {page} ---\n{chunk.page_content}"
+            chunk.page_content = bersihkan_teks(chunk.page_content)
+            chunk.metadata = {
+                k: (bersihkan_teks(v) if isinstance(v, str) else v)
+                for k, v in chunk.metadata.items()
+            }
+
+        get_vector_db().add_documents(potongan)
+        UPLOAD_STATUS[filename] = {"status": "sukses", "detail": f"{filename} berhasil diindeks!"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        UPLOAD_STATUS[filename] = {"status": "error", "detail": str(e)}
+
+@app.post("/api/upload")
+async def upload_dokumen(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+    x_session_id: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    if not os.path.exists("./kumpulan_dokumen"):
+        os.makedirs("./kumpulan_dokumen")
+
+    filename = file.filename
+    file_path = f"./kumpulan_dokumen/{filename}"
+
+    user_id = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.replace("Bearer ", "")
+        payload = decode_token(token)
+        if payload:
+            user_id = payload.get("sub") or payload.get("id")
+
+    # Simpan file dulu secara sinkron (cepat), lalu proses di background
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal menyimpan file: {str(e)}")
+
+    UPLOAD_STATUS[filename] = {"status": "proses", "detail": f"{filename} sedang diindeks..."}
+    background_tasks.add_task(_proses_dokumen, file_path, filename, user_id, x_session_id)
+
+    return {"status": "proses", "pesan": f"{filename} sedang diproses di background."}
+
+@app.get("/api/upload/status/{filename}")
+async def upload_status(filename: str):
+    status = UPLOAD_STATUS.get(filename)
+    if not status:
+        raise HTTPException(status_code=404, detail="Status tidak ditemukan.")
+    return status
         
 # ==========================================
 # ENDPOINT: MELIHAT & MENGHAPUS DOKUMEN
 # ==========================================
 @app.get("/api/files")
-async def lihat_daftar_dokumen():
+async def lihat_daftar_dokumen(
+    x_session_id: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
     try:
         if not os.path.exists("./kumpulan_dokumen"):
             return {"files": []}
-        daftar_file = [f for f in os.listdir("./kumpulan_dokumen") if os.path.isfile(os.path.join("./kumpulan_dokumen", f))]
+
+        user_id = None
+        if authorization and authorization.startswith("Bearer "):
+            payload = decode_token(authorization.replace("Bearer ", ""))
+            if payload:
+                user_id = payload.get("sub") or payload.get("id")
+
+        conn = get_raw_connection()
+        try:
+            cur = conn.cursor()
+            if user_id:
+                cur.execute(
+                    "SELECT DISTINCT cmetadata->>'source' FROM langchain_pg_embedding WHERE cmetadata->>'user_id' = %s",
+                    (user_id,),
+                )
+            elif x_session_id:
+                cur.execute(
+                    "SELECT DISTINCT cmetadata->>'source' FROM langchain_pg_embedding "
+                    "WHERE cmetadata->>'session_id' = %s "
+                    "AND (cmetadata->>'user_id' IS NULL OR cmetadata->>'user_id' = '')",
+                    (x_session_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT DISTINCT cmetadata->>'source' FROM langchain_pg_embedding "
+                    "WHERE (cmetadata->>'user_id' IS NULL OR cmetadata->>'user_id' = '') "
+                    "AND (cmetadata->>'session_id' IS NULL OR cmetadata->>'session_id' = '')"
+                )
+            sumber_terotorisasi = {row[0] for row in cur.fetchall() if row[0]}
+            cur.close()
+        finally:
+            conn.close()
+
+        daftar_file = [
+            f
+            for f in os.listdir("./kumpulan_dokumen")
+            if os.path.isfile(os.path.join("./kumpulan_dokumen", f)) and f in sumber_terotorisasi
+        ]
         return {"files": daftar_file}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -185,12 +282,154 @@ async def hapus_dokumen(filename: str):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
     try:
         os.remove(file_path)
+        # PERBAIKAN: Hapus dari database vektor agar AI "lupa"
         try:
-            vektor_db.delete(where={"source": filename})
-        except:
-            pass
+            conn = get_raw_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM langchain_pg_embedding WHERE cmetadata->>'source' = %s",
+                (filename,)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as db_err:
+            print(f"Gagal menghapus vektor dari database: {db_err}")
+            
         return {"status": "sukses", "pesan": f"{filename} dihapus!"}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# AUTH: MODELS & ENDPOINTS
+# ==========================================
+class AuthRegister(BaseModel):
+    email: str
+    password: str
+    session_id: Optional[str] = None
+
+class AuthLogin(BaseModel):
+    email: str
+    password: str
+    session_id: Optional[str] = None
+
+class AuthResponse(BaseModel):
+    token: str
+    user: UserPublic
+
+@app.on_event("startup")
+async def init_users_table():
+    try:
+        conn = get_raw_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("[DB] Table 'users' ready")
+    except Exception as e:
+        print(f"[DB] Warning: could not create users table: {e}")
+
+@app.post("/api/auth/register", response_model=AuthResponse)
+async def register(body: AuthRegister):
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email = %s", (body.email,))
+        if cur.fetchone():
+            raise HTTPException(status_code=400, detail="Email sudah terdaftar")
+
+        user_id = str(uuid.uuid4())
+        hashed = hash_password(body.password)
+        cur.execute(
+            "INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s)",
+            (user_id, body.email, hashed),
+        )
+        conn.commit()
+
+        if body.session_id:
+            doc_count = auto_claim_documents(body.session_id, user_id)
+            chat_count = auto_claim_chat_sessions(body.session_id, user_id)
+
+        token = create_access_token({"sub": user_id, "email": body.email})
+        cur.execute("SELECT created_at FROM users WHERE id = %s", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        return AuthResponse(
+            token=token,
+            user=UserPublic(id=user_id, email=body.email, created_at=str(row[0])),
+        )
+    except HTTPException:
+        conn.close()
+        raise
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+async def login(body: AuthLogin):
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, password_hash, created_at FROM users WHERE email = %s", (body.email,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=401, detail="Email atau password salah")
+
+        user_id, email, password_hash, created_at = row
+        if not verify_password(body.password, password_hash):
+            raise HTTPException(status_code=401, detail="Email atau password salah")
+
+        if body.session_id:
+            doc_count = auto_claim_documents(body.session_id, user_id)
+            chat_count = auto_claim_chat_sessions(body.session_id, user_id)
+
+        cur.close()
+        conn.close()
+        token = create_access_token({"sub": user_id, "email": email})
+        return AuthResponse(
+            token=token,
+            user=UserPublic(id=user_id, email=email, created_at=str(created_at)),
+        )
+    except HTTPException:
+        conn.close()
+        raise
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/auth/me")
+async def get_me(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Tidak terautentikasi")
+    payload = decode_token(authorization.replace("Bearer ", ""))
+    if not payload:
+        raise HTTPException(status_code=401, detail="Token tidak valid")
+    conn = get_raw_connection()
+    try:
+        cur = conn.cursor()
+        user_id = payload.get("sub") or payload.get("id")
+        cur.execute("SELECT id, email, created_at FROM users WHERE id = %s", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="User tidak ditemukan")
+        return UserPublic(id=row[0], email=row[1], created_at=str(row[2]))
+    except HTTPException:
+        conn.close()
+        raise
+    except Exception as e:
+        conn.close()
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
@@ -203,26 +442,58 @@ class Pertanyaan(BaseModel):
     temperature: Optional[float] = None
     k: Optional[int] = None
 
+def _build_user_filter(selected_files, user_payload, session_id):
+    filter_parts = []
+
+    if user_payload:
+        user_id = user_payload.get("sub") or user_payload.get("id")
+        filter_parts.append({"user_id": user_id})
+        if session_id:
+            filter_parts.append({"session_id": session_id})
+    elif session_id:
+        filter_parts.append({"session_id": session_id})
+
+    if selected_files:
+        if len(selected_files) == 1:
+            filter_parts.append({"source": selected_files[0]})
+        else:
+            filter_parts.append({"source": {"$in": selected_files}})
+
+    if not filter_parts:
+        return None
+
+    if len(filter_parts) == 1:
+        return filter_parts[0]
+
+    return {"$and": filter_parts}
+
 @app.post("/api/chat")
-async def chat_ai(pertanyaan: Pertanyaan):
+async def chat_ai(
+    pertanyaan: Pertanyaan,
+    x_session_id: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
     try:
         temp = pertanyaan.temperature or 0.5
         k_val = pertanyaan.k or 10
         current_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=temp)
-        
-        filter_dict = None
-        if pertanyaan.selected_files:
-            if len(pertanyaan.selected_files) == 1:
-                filter_dict = {"source": pertanyaan.selected_files[0]}
-            else:
-                filter_dict = {"source": {"$in": pertanyaan.selected_files}}
+
+        user_payload = None
+        if authorization and authorization.startswith("Bearer "):
+            user_payload = decode_token(authorization.replace("Bearer ", ""))
+
+        filter_dict = _build_user_filter(pertanyaan.selected_files, user_payload, x_session_id)
                 
         if filter_dict:
-            dokumen_relevan = vektor_db.similarity_search(query=pertanyaan.teks, k=k_val, filter=filter_dict)
+            vector_results = get_vector_db().similarity_search(query=pertanyaan.teks, k=k_val * 3, filter=filter_dict)
+            re_ranked = re_rank(pertanyaan.teks, vector_results, k=k_val)
+            dokumen_relevan = re_ranked
         else:
-            retriever_dynamic = vektor_db.as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
-            dokumen_relevan = retriever_dynamic.invoke(pertanyaan.teks)
-        
+            retriever_dynamic = get_vector_db().as_retriever(search_type="mmr", search_kwargs={"k": k_val * 3, "fetch_k": k_val * 6})
+            vector_results = retriever_dynamic.invoke(pertanyaan.teks)
+            re_ranked = re_rank(pertanyaan.teks, vector_results, k=k_val)
+            dokumen_relevan = re_ranked
+
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
         )
@@ -271,15 +542,66 @@ async def chat_ai(pertanyaan: Pertanyaan):
 
 # ==========================================
 # ENDPOINT: DOWNLOAD FILE (ASLI & HASIL AI)
+import logging
+
+# Setup Logging
+logging.basicConfig(
+    filename='rag_performance.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s'
+)
+
+
+def re_rank(query: str, documents: List[Document], k: int = 3) -> List[Document]:
+    if not documents:
+        return []
+    
+    pairs = [(query, doc.page_content) for doc in documents]
+    scores = reranker.predict(pairs)
+    
+    # Urutkan berdasarkan skor re-ranker
+    scored_docs = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
+    return [doc for score, doc in scored_docs[:k]]
+
+    return re.sub(r"[^a-z0-9]+", " ", nama.lower()).strip()
+
+def _normalisasi_nama(nama: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+", " ", nama.lower()).strip()
+
+def _resolve_file_path(filename: str, folder: str = "./kumpulan_dokumen") -> str:
+    """Menemukan path file di folder, toleran terhadap beda spasi/underscore/case."""
+    import urllib.parse
+    filename = urllib.parse.unquote(filename)
+    folder_abs = os.path.abspath(folder)
+    exact = os.path.join(folder_abs, filename)
+    if os.path.exists(exact):
+        return exact
+
+    target = _normalisasi_nama(filename)
+    if not target:
+        return exact
+
+    semua = [n for n in os.listdir(folder_abs) if os.path.isfile(os.path.join(folder_abs, n))]
+    cocok = [n for n in semua if _normalisasi_nama(n) == target]
+    if len(cocok) == 1:
+        return os.path.join(folder_abs, cocok[0])
+    if len(cocok) > 1:
+        return os.path.join(folder_abs, min(cocok, key=lambda n: len(n)))
+
+    parsial = [n for n in semua if target in _normalisasi_nama(n) or _normalisasi_nama(n) in target]
+    if parsial:
+        return os.path.join(folder_abs, min(parsial, key=lambda n: len(n)))
+
+    return exact
+
 # ==========================================
 @app.get("/api/files/download/{filename}")
 async def download_file(filename: str):
-    import urllib.parse
-    filename = urllib.parse.unquote(filename)
-    file_path = os.path.join("./kumpulan_dokumen", filename)
+    file_path = _resolve_file_path(filename, "./kumpulan_dokumen")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
-    return FileResponse(file_path)
+    return FileResponse(file_path, filename=os.path.basename(file_path))
 
 @app.get("/api/generated/download/{filename}")
 async def download_generated_file(filename: str):
@@ -292,14 +614,12 @@ async def download_generated_file(filename: str):
 
 @app.get("/api/files/preview/{filename}")
 async def preview_file(filename: str):
-    import urllib.parse
-    filename = urllib.parse.unquote(filename)
-    
-    file_path = os.path.abspath(os.path.join("./kumpulan_dokumen", filename))
+    file_path = _resolve_file_path(filename, "./kumpulan_dokumen")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
         
-    ekstensi = filename.lower().split('.')[-1]
+    nama_disk = os.path.basename(file_path)
+    ekstensi = nama_disk.lower().split('.')[-1]
     if ekstensi == "pdf":
         return FileResponse(file_path)
         
@@ -307,7 +627,7 @@ async def preview_file(filename: str):
     if not os.path.exists(preview_dir):
         os.makedirs(preview_dir)
         
-    pdf_filename = f"{filename}.pdf"
+    pdf_filename = f"{nama_disk}.pdf"
     pdf_path = os.path.join(preview_dir, pdf_filename)
     
     if os.path.exists(pdf_path):
@@ -350,24 +670,36 @@ async def preview_file(filename: str):
 # ENDPOINT: CHAT STREAMING (DENGAN BUFFER & ANTI-ERROR)
 # ==========================================
 @app.post("/api/chat/stream")
-async def chat_ai_stream(pertanyaan: Pertanyaan):
+async def chat_ai_stream(
+    pertanyaan: Pertanyaan,
+    x_session_id: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
     try:
         temp = pertanyaan.temperature or 0.5
         k_val = pertanyaan.k or 10
         current_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=temp)
 
-        filter_dict = None
-        if pertanyaan.selected_files:
-            if len(pertanyaan.selected_files) == 1:
-                filter_dict = {"source": pertanyaan.selected_files[0]}
-            else:
-                filter_dict = {"source": {"$in": pertanyaan.selected_files}}
+        user_payload = None
+        if authorization and authorization.startswith("Bearer "):
+            user_payload = decode_token(authorization.replace("Bearer ", ""))
+
+        filter_dict = _build_user_filter(pertanyaan.selected_files, user_payload, x_session_id)
+                
+        # Inisialisasi variabel untuk diakses di generate()
+        vector_results = []
+        dokumen_relevan = []
+        corrected = False
+
+        filter_dict = _build_user_filter(pertanyaan.selected_files, user_payload, x_session_id)
                 
         if filter_dict:
-            dokumen_relevan = vektor_db.similarity_search(query=pertanyaan.teks, k=k_val, filter=filter_dict)
+            vector_results = get_vector_db().similarity_search(query=pertanyaan.teks, k=k_val, filter=filter_dict)
+            dokumen_relevan = vector_results
         else:
-            retriever_dynamic = vektor_db.as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
-            dokumen_relevan = retriever_dynamic.invoke(pertanyaan.teks)
+            retriever_dynamic = get_vector_db().as_retriever(search_type="mmr", search_kwargs={"k": k_val, "fetch_k": k_val * 2})
+            vector_results = retriever_dynamic.invoke(pertanyaan.teks)
+            dokumen_relevan = vector_results
             
         konteks_dengan_sumber = "\n\n---\n\n".join(
             [f"[Sumber: {doc.metadata.get('source', 'Unknown')}, halaman {doc.metadata.get('page', 1)}]\n{doc.page_content}" for doc in dokumen_relevan]
@@ -376,62 +708,45 @@ async def chat_ai_stream(pertanyaan: Pertanyaan):
         history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in pertanyaan.history[-6:]]) if pertanyaan.history else ""
         full_context = f"History:\n{history_text}\n\nKonteks Dokumen:\n{konteks_dengan_sumber}"
         
+        # Panggil LLM untuk jawaban
         chain = prompt | current_llm | StrOutputParser()
         
         async def generate():
             import json, re
-            full_response = ""
-            is_generating_file = False
-            buffer_stream = "" 
+            full_response = await chain.ainvoke({"context": full_context, "question": pertanyaan.teks})
             
-            async for chunk in chain.astream({"context": full_context, "question": pertanyaan.teks}):
-                full_response += chunk
-                
-                if not is_generating_file:
-                    # Gabung buffer + chunk untuk deteksi tag yang akurat
-                    combined = buffer_stream + chunk
-                    up = combined.upper()
-                    pos_nama = up.find("<NAMA_FILE>")
-                    pos_isi = up.find("<ISI_DOKUMEN>")
-                    
-                    if pos_nama >= 0 or pos_isi >= 0:
-                        # Tag ditemukan - cari posisi tag terawal
-                        tag_pos = len(combined)
-                        if pos_nama >= 0: tag_pos = min(tag_pos, pos_nama)
-                        if pos_isi >= 0:  tag_pos = min(tag_pos, pos_isi)
-                        
-                        # Kirim teks AMAN sebelum tag (tidak ada yg terpotong)
-                        safe_text = combined[:tag_pos]
-                        if safe_text:
-                            yield f"data: {json.dumps({'token': safe_text})}\n\n"
-                        
-                        is_generating_file = True
-                        buffer_stream = ""
-                        pesan_tunggu = "\n\n*(Sedang menyusun dokumen, mohon tunggu...)*\n"
-                        yield f"data: {json.dumps({'token': pesan_tunggu})}\n\n"
-                        continue
-                    
-                    # Tidak ada tag → streaming normal dengan buffer aman
-                    buffer_stream += chunk
-                    last_angle_idx = buffer_stream.rfind("<")
-                    
-                    if last_angle_idx != -1:
-                        potential_tag = buffer_stream[last_angle_idx:].upper()
-                        if "<NAMA_FILE>".startswith(potential_tag) or "<ISI_DOKUMEN>".startswith(potential_tag):
-                            safe_text = buffer_stream[:last_angle_idx]
-                            if safe_text:
-                                yield f"data: {json.dumps({'token': safe_text})}\n\n"
-                            buffer_stream = buffer_stream[last_angle_idx:] 
-                        else:
-                            yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
-                            buffer_stream = ""
-                    else:
-                        yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
-                        buffer_stream = ""
+            # Cek apakah ini permintaan download file
+            is_download_request = "/api/files/download/" in full_response
+            
+            # Self-Correction Loop: Verifikasi sitasi (Bypass jika request download atau penolakan konteks)
+            is_corrected = False
+            # Deteksi apakah AI menjawab tidak tahu atau informasi tidak ada
+            is_reject_response = "maaf" in full_response.lower() and ("tidak menemukan" in full_response.lower() or "tidak terdapat" in full_response.lower())
+            
+            if not is_download_request and not is_reject_response and "[Sumber:" not in full_response:
+                correction_prompt = ChatPromptTemplate.from_template(
+                    "Jawaban ini tidak mengandung sitasi. Tolong susun ulang jawaban berikut dengan sitasi berdasarkan konteks.\n\nKonteks: {context}\n\nJawaban awal: {jawaban}"
+                )
+                correction_chain = correction_prompt | current_llm | StrOutputParser()
+                full_response = await correction_chain.ainvoke({"context": full_context, "jawaban": full_response})
+                is_corrected = True
 
-            if buffer_stream and not is_generating_file:
-                yield f"data: {json.dumps({'token': buffer_stream})}\n\n"
+            # Deteksi pembuatan dokumen
+            is_generating_file = False
+            match_isi = re.search(r"<ISI_DOKUMEN>(.*?)(?:</ISI_DOKUMEN>|$)", full_response, re.DOTALL | re.IGNORECASE)
+            match_nama = re.search(r"<NAMA_FILE>(.*?)</NAMA_FILE>", full_response, re.IGNORECASE)
+            
+            chat_text = full_response
+            if match_isi and match_nama:
+                is_generating_file = True
+                # Bersihkan chat_text dari tag XML sebelum distream ke user
+                chat_text = re.sub(r"<NAMA_FILE>.*?</NAMA_FILE>", "", chat_text, flags=re.IGNORECASE | re.DOTALL)
+                chat_text = re.sub(r"<ISI_DOKUMEN>.*?(?:</ISI_DOKUMEN>|$)", "", chat_text, flags=re.IGNORECASE | re.DOTALL)
 
+            # Streaming response murni tanpa tag XML
+            for token in chat_text:
+                yield f"data: {json.dumps({'token': token})}\n\n"
+            
             # ---------------------------------------------------------
             # PROSES PEMBUATAN FILE FISIK SETELAH STREAMING SELESAI
             # ---------------------------------------------------------
@@ -454,36 +769,29 @@ async def chat_ai_stream(pertanyaan: Pertanyaan):
                     os.makedirs("./dokumen_hasil", exist_ok=True)
                     lokasi_simpan = f"./dokumen_hasil/{nama_unik}"
                     
-                    # PERBAIKAN 3: Mode "Anti-Crash". Jika PDF gagal dibuat, jadikan file TXT biasa
+                    # PERBAIKAN: Jika PDF gagal dibuat, gunakan TXT dengan ekstensi TXT
                     try:
-                        if nama_file_asli.lower().endswith('.pdf'):
-                            pdf = FPDF()
-                            pdf.add_page()
-                            pdf.set_font("Arial", size=11)
-                            
-                            # Abaikan karakter emoji/simbol aneh yang bikin PDF crash
-                            isi_teks_pdf = isi_teks.encode('latin-1', 'ignore').decode('latin-1')
-                            pdf.multi_cell(0, 7, txt=isi_teks_pdf)
-                            pdf.output(lokasi_simpan)
-                        else:
-                            with open(lokasi_simpan, "w", encoding="utf-8") as f:
-                                f.write(isi_teks)
-                                
-                        link_download = f"http://localhost:8000/api/generated/download/{nama_unik}"
-                        pesan_selesai = f"\n\n✨ **Selesai!** 📥 [**Unduh {nama_file_asli} di sini**]({link_download})"
-                        yield f"data: {json.dumps({'token': pesan_selesai})}\n\n"
-                        
+                        # Coba buat PDF
+                        pdf = FPDF()
+                        pdf.add_page()
+                        pdf.set_font("Arial", size=11)
+                        # Sanitasi teks agar aman untuk FPDF (Latin-1)
+                        isi_teks_pdf = isi_teks.encode('latin-1', 'ignore').decode('latin-1')
+                        pdf.multi_cell(0, 7, txt=isi_teks_pdf)
+                        pdf.output(lokasi_simpan)
+                        final_filename = nama_file_asli
                     except Exception as e:
-                        # JIKA FPDF ERROR, OTOMATIS BIKIN TXT (Fallback)
-                        fallback_nama = f"Fallback_{uuid.uuid4().hex[:6]}.txt"
-                        fallback_lokasi = f"./dokumen_hasil/{fallback_nama}"
-                        
-                        with open(fallback_lokasi, "w", encoding="utf-8") as f:
+                        # Fallback ke TXT jika PDF gagal
+                        print(f"Gagal membuat PDF, fallback ke TXT: {e}")
+                        txt_path = lokasi_simpan.replace(".pdf", ".txt")
+                        with open(txt_path, "w", encoding="utf-8") as f:
                             f.write(isi_teks)
-                            
-                        link_download = f"http://localhost:8000/api/generated/download/{fallback_nama}"
-                        pesan_fallback = f"\n\n⚠️ *(Gagal membuat PDF karena format tidak didukung, dialihkan ke Teks)*\n📥 [**Unduh Dokumen di sini**]({link_download})"
-                        yield f"data: {json.dumps({'token': pesan_fallback})}\n\n"
+                        lokasi_simpan = txt_path
+                        final_filename = nama_file_asli.replace(".pdf", ".txt")
+                        
+                    link_download = f"http://localhost:8000/api/generated/download/{os.path.basename(lokasi_simpan)}"
+                    pesan_selesai = f"\n\n✨ **Selesai!** 📥 [**Unduh {final_filename} di sini**]({link_download})"
+                    yield f"data: {json.dumps({'token': pesan_selesai})}\n\n"
                 else:
                     # Kalau AI ngaco banget balasannya
                     pesan_gagal = "\n\n*(Sistem gagal mendeteksi format dokumen dari AI)*"
@@ -528,33 +836,70 @@ def _simpan_chat(data: list):
 # ENDPOINT 3: CHAT HISTORY
 # ==========================================
 @app.get("/api/chat/sessions")
-async def list_sessions():
-    return _baca_chat()
+async def list_sessions(
+    x_session_id: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    all_sessions = _baca_chat()
+    user_payload = None
+    if authorization and authorization.startswith("Bearer "):
+        user_payload = decode_token(authorization.replace("Bearer ", ""))
+
+    if user_payload:
+        user_id = user_payload.get("sub") or user_payload.get("id")
+        filtered = [s for s in all_sessions if s.get("user_id") == user_id]
+        return filtered
+    elif x_session_id:
+        filtered = [s for s in all_sessions if s.get("session_id") == x_session_id and not s.get("user_id")]
+        return filtered
+    else:
+        return []
 
 @app.post("/api/chat/sessions")
-async def create_session():
+async def create_session(
+    x_session_id: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
     data = _baca_chat()
+    user_payload = None
+    if authorization and authorization.startswith("Bearer "):
+        user_payload = decode_token(authorization.replace("Bearer ", ""))
+
     baru = {
         "id": str(uuid.uuid4()),
         "title": "Percakapan baru",
         "messages": [],
-        "created_at": datetime.now().isoformat()
+        "created_at": datetime.now().isoformat(),
     }
+    if user_payload:
+        baru["user_id"] = user_payload.get("sub") or user_payload.get("id")
+    elif x_session_id:
+        baru["session_id"] = x_session_id
+
     data.insert(0, baru)
     _simpan_chat(data)
     return baru
 
 @app.put("/api/chat/sessions/{session_id}")
-async def update_session(session_id: str, body: ChatSessionModel):
+async def update_session(
+    session_id: str,
+    body: ChatSessionModel,
+    authorization: Optional[str] = Header(None),
+):
     data = _baca_chat()
     for i, s in enumerate(data):
         if s["id"] == session_id:
-            data[i] = {
+            updated = {
                 "id": session_id,
                 "title": body.title or "Percakapan baru",
                 "messages": [m.model_dump() for m in body.messages],
-                "created_at": s.get("created_at", datetime.now().isoformat())
+                "created_at": s.get("created_at", datetime.now().isoformat()),
             }
+            if s.get("user_id"):
+                updated["user_id"] = s["user_id"]
+            if s.get("session_id") and not s.get("user_id"):
+                updated["session_id"] = s["session_id"]
+            data[i] = updated
             _simpan_chat(data)
             return data[i]
     raise HTTPException(status_code=404, detail="Sesi tidak ditemukan.")

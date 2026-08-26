@@ -14,7 +14,23 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="id" suppressHydrationWarning>
-      <body className={`font-sans bg-canvas text-ink antialiased`}>
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              try {
+                var t=localStorage.getItem("theme");
+                if(t==="dark") document.documentElement.classList.add("dark");
+                else if(!t||t==="system"){
+                  if(window.matchMedia("(prefers-color-scheme: dark)").matches)
+                    document.documentElement.classList.add("dark");
+                }
+              }catch(e){}
+            `,
+          }}
+        />
+      </head>
+      <body className="font-sans bg-canvas text-ink antialiased">
         <Providers>
           {children}
         </Providers>
@@ -22,4 +38,3 @@ export default function RootLayout({
     </html>
   );
 }
-
