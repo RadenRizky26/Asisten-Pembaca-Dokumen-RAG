@@ -71,7 +71,7 @@ export default function Home() {
     pesanAkhirRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chat, streamingText]);
 
-  const API = "http://localhost:8000";
+  const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
   const authHeaders = useCallback((): Record<string, string> => {
     const headers: Record<string, string> = {};
@@ -84,7 +84,7 @@ export default function Home() {
 
   const fetchFiles = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/api/files`, { headers: authHeaders() });
+      const res = await fetch(`${BACKEND_URL}/api/files`, { headers: authHeaders() });
       const data = await res.json();
       if (data.files) setDaftarFile(data.files);
     } catch (error) {
@@ -94,7 +94,7 @@ export default function Home() {
 
   const fetchSessions = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/api/chat/sessions`, {
+      const res = await fetch(`${BACKEND_URL}/api/chat/sessions`, {
         headers: authHeaders(),
       });
       if (res.ok) setChatSessions(await res.json());
@@ -112,7 +112,7 @@ export default function Home() {
 
   const createNewChat = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/api/chat/sessions`, {
+      const res = await fetch(`${BACKEND_URL}/api/chat/sessions`, {
         method: "POST",
         headers: authHeaders(),
       });
@@ -129,7 +129,7 @@ export default function Home() {
     async (id: string, e: React.MouseEvent) => {
       e.stopPropagation();
       try {
-        await fetch(`${API}/api/chat/sessions/${id}`, {
+        await fetch(`${BACKEND_URL}/api/chat/sessions/${id}`, {
           method: "DELETE",
           headers: authHeaders(),
         });
@@ -161,7 +161,7 @@ export default function Home() {
   const saveSession = useCallback(
     async (id: string, title: string, messages: Message[]) => {
       try {
-        await fetch(`${API}/api/chat/sessions/${id}`, {
+        await fetch(`${BACKEND_URL}/api/chat/sessions/${id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify({ id, title, messages }),
@@ -187,7 +187,7 @@ export default function Home() {
     const title = chat.length === 0 ? pertanyaan.slice(0, 50) : undefined;
 
     try {
-      const res = await fetch(`${API}/api/chat/stream`, {
+      const res = await fetch(`${BACKEND_URL}/api/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
@@ -302,7 +302,7 @@ export default function Home() {
 
       const doUpload = async () => {
         try {
-          const res = await fetch(`${API}/api/upload`, {
+          const res = await fetch(`${BACKEND_URL}/api/upload`, {
             method: "POST",
             headers: authHeaders(),
             body: formData,
@@ -319,7 +319,7 @@ export default function Home() {
             await new Promise((r) => setTimeout(r, 2000));
             try {
               const statusRes = await fetch(
-                `${API}/api/upload/status/${encodeURIComponent(namaFile)}`,
+                `${BACKEND_URL}/api/upload/status/${encodeURIComponent(namaFile)}`,
                 { headers: authHeaders() }
               );
               if (statusRes.ok) {
@@ -360,7 +360,7 @@ export default function Home() {
   const executeDelete = async (namaFile: string) => {
     setConfirmDelete(null);
     try {
-      const res = await fetch(`${API}/api/files/${namaFile}`, {
+      const res = await fetch(`${BACKEND_URL}/api/files/${namaFile}`, {
         method: "DELETE",
         headers: authHeaders(),
       });

@@ -10,7 +10,7 @@ Aplikasi RAG (Retrieval-Augmented Generation) berbasis AI untuk bertanya jawab p
 - **Riwayat Chat**: Simpan dan kelola sesi percakapan.
 
 ## Stack Teknologi
-- **Backend**: FastAPI, LangChain, Google Gemini API, ChromaDB.
+- **Backend**: FastAPI, LangChain, Google Gemini API, PgVector.
 - **Frontend**: Next.js, Tailwind CSS, React-Markdown.
 
 ## Setup

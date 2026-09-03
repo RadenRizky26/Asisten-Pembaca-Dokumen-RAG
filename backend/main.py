@@ -11,14 +11,20 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import List, Optional
 
-import comtypes.client
-import pythoncom
+try:
+    import comtypes.client
+    import pythoncom
+except ImportError:
+    comtypes = None  # type: ignore
+    pythoncom = None  # type: ignore
 
 from auth import (
     hash_password, verify_password, create_access_token,
     get_optional_user, decode_token, UserPublic
 )
 from database.db import auto_claim_documents, auto_claim_chat_sessions, get_raw_connection
+import tempfile as _tmp
+import storage as _storage  # Supabase Storage (fallback lokal jika env kosong)
 
 def bersihkan_teks(teks: str) -> str:
     if not teks:
@@ -44,18 +50,26 @@ from fpdf import FPDF
 # Inisialisasi FastAPI
 app = FastAPI(title="API Asisten Pembaca Dokumen")
 
+load_dotenv()
+
+# ponytail: allow_origins=["*"]+allow_credentials=True rejected by browsers; tighten to Vercel URL when stable
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+@app.get("/ping")
+async def ping():
+    return {"status": "awake"}
+
 # ==========================================
 # INISIALISASI AI & DATABASE (LAZY)
 # ==========================================
-load_dotenv()
 
 def get_vector_db():
     if not hasattr(get_vector_db, "_instance"):
@@ -69,13 +83,14 @@ def get_vector_db():
     return get_vector_db._instance
 
 # --- PERBAIKAN: INSTRUKSI PROMPT YANG SANGAT KETAT ---
-template_instruksi = """
+# ponytail: rendered at import via BACKEND_PUBLIC_URL; if URL changes without restart, rebuild prompt
+template_instruksi = f"""
     Kamu adalah asisten AI spesialis pembaca dokumen.
     Konteks dokumen di bawah ini telah dilengkapi dengan metadata [Sumber: Nama_File, halaman X].
 
     ATURAN DASAR MENJAWAB (PERTANYAAN BIASA):
     1. Jawablah pertanyaan pengguna dengan bahasa yang ramah, santai, dan sangat mudah dipahami (seperti menjelaskan kepada teman atau orang awam), tanpa jargon teknis yang membingungkan.
-    2. Jika pengguna menanyakan rumus atau istilah teknis yang rumit, berikan analogi atau perumpamaan sederhana agar lebih mudah dimengerti. 
+    2. Jika pengguna menanyakan rumus atau istilah teknis yang rumit, berikan analogi atau perumpamaan sederhana agar lebih mudah dimengerti.
     3. DILARANG menduplikasi penulisan variabel teknis. Sajikan dengan format yang bersih dan rapi.
     4. SITASI ADALAH KEWAJIBAN MUTLAK! Setiap kali kamu menuliskan fakta atau data dari dokumen, kamu WAJIB menempelkan sitasi tepat di ujung kalimat tersebut dalam format: **[Sumber: Nama_File.pdf, halaman X]**.
     5. JAWAB HANYA BERDASARKAN KONTEKS! Jika jawaban tidak ditemukan di dokumen, katakan dengan sopan: "Maaf, saya tidak menemukan informasi tersebut di dalam dokumen yang Anda berikan." DILARANG mengarang jawaban dari pengetahuan umum.
@@ -84,7 +99,7 @@ template_instruksi = """
 
     JALUR KHUSUS A (PENGGUNA MEMINTA DOWNLOAD FILE ASLI):
     - HANYA aktif jika pengguna secara sadar mengetik: "minta file asli", "download dokumennya", "berikan filenya", "kirim dokumen", "kirimkan dokumen asli".
-    - Berikan tautan ini di akhir: 📥 [Unduh Nama_File_Asli.pdf](http://localhost:8000/api/files/download/Nama_File_Asli.pdf)
+    - Berikan tautan ini di akhir: 📥 [Unduh Nama_File_Asli.pdf]({BACKEND_PUBLIC_URL}/api/files/download/Nama_File_Asli.pdf)
     - JIKA TIDAK DIMINTA, JANGAN BERIKAN LINK INI.
 
     JALUR KHUSUS B (PENGGUNA MEMINTA DIBUATKAN DOKUMEN BARU):
@@ -96,9 +111,9 @@ template_instruksi = """
       </ISI_DOKUMEN>
 
     Konteks Dokumen:
-    {context}
+    {{context}}
 
-    Pertanyaan Pengguna: {question}
+    Pertanyaan Pengguna: {{question}}
 
     Jawaban:
 """
@@ -190,11 +205,7 @@ async def upload_dokumen(
     x_session_id: Optional[str] = Header(None),
     authorization: Optional[str] = Header(None),
 ):
-    if not os.path.exists("./kumpulan_dokumen"):
-        os.makedirs("./kumpulan_dokumen")
-
     filename = file.filename
-    file_path = f"./kumpulan_dokumen/{filename}"
 
     user_id = None
     if authorization and authorization.startswith("Bearer "):
@@ -203,10 +214,22 @@ async def upload_dokumen(
         if payload:
             user_id = payload.get("sub") or payload.get("id")
 
-    # Simpan file dulu secara sinkron (cepat), lalu proses di background
     try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        data = await file.read()
+        # Persist ke Supabase Storage jika aktif, fallback ke disk lokal
+        if _storage.is_enabled():
+            _, _, bucket_asli, _ = _storage._cfg()
+            _storage.upload_bytes(bucket_asli, filename, data, file.content_type or "application/octet-stream")
+            # Tulis ke /tmp untuk indexing (Render disk ephemeral, /tmp aman)
+            file_path = os.path.join(_tmp.gettempdir(), filename)
+            with open(file_path, "wb") as buffer:
+                buffer.write(data)
+        else:
+            if not os.path.exists("./kumpulan_dokumen"):
+                os.makedirs("./kumpulan_dokumen")
+            file_path = f"./kumpulan_dokumen/{filename}"
+            with open(file_path, "wb") as buffer:
+                buffer.write(data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal menyimpan file: {str(e)}")
 
@@ -231,7 +254,10 @@ async def lihat_daftar_dokumen(
     authorization: Optional[str] = Header(None),
 ):
     try:
-        if not os.path.exists("./kumpulan_dokumen"):
+        # Storage mode: list dari Supabase Storage, bukan disk
+        if _storage.is_enabled():
+            pass  # lanjut ke filter vector DB, daftar diambil dari bucket di bawah
+        elif not os.path.exists("./kumpulan_dokumen"):
             return {"files": []}
 
         user_id = None
@@ -266,39 +292,54 @@ async def lihat_daftar_dokumen(
         finally:
             conn.close()
 
-        daftar_file = [
-            f
-            for f in os.listdir("./kumpulan_dokumen")
-            if os.path.isfile(os.path.join("./kumpulan_dokumen", f)) and f in sumber_terotorisasi
-        ]
+        if _storage.is_enabled():
+            _, _, bucket_asli, _ = _storage._cfg()
+            try:
+                bucket_files = _storage.list_objects(bucket_asli)
+            except Exception as e:
+                print(f"[storage] list failed: {e}")
+                bucket_files = []
+            # Fallback: jika bucket kosong/belum ada, tetap tampilkan sumber dari DB
+            pool = set(bucket_files) if bucket_files else sumber_terotorisasi
+            daftar_file = [f for f in pool if f in sumber_terotorisasi]
+        else:
+            daftar_file = [
+                f for f in os.listdir("./kumpulan_dokumen")
+                if os.path.isfile(os.path.join("./kumpulan_dokumen", f)) and f in sumber_terotorisasi
+            ]
         return {"files": daftar_file}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/files/{filename}")
 async def hapus_dokumen(filename: str):
-    file_path = os.path.join("./kumpulan_dokumen", filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File tidak ditemukan.")
-    try:
-        os.remove(file_path)
-        # PERBAIKAN: Hapus dari database vektor agar AI "lupa"
+    is_storage = _storage.is_enabled()
+    if is_storage:
+        _, _, bucket_asli, _ = _storage._cfg()
         try:
-            conn = get_raw_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "DELETE FROM langchain_pg_embedding WHERE cmetadata->>'source' = %s",
-                (filename,)
-            )
-            conn.commit()
-            cur.close()
-            conn.close()
-        except Exception as db_err:
-            print(f"Gagal menghapus vektor dari database: {db_err}")
-            
-        return {"status": "sukses", "pesan": f"{filename} dihapus!"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            _storage.delete_objects(bucket_asli, [filename])
+        except Exception as e:
+            print(f"[storage] delete {filename}: {e}")
+        # tetap hapus vektor meski file bucket 404
+    else:
+        file_path = os.path.join("./kumpulan_dokumen", filename)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File tidak ditemukan.")
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    # Hapus dari database vektor agar AI "lupa"
+    try:
+        conn = get_raw_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM langchain_pg_embedding WHERE cmetadata->>'source' = %s", (filename,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as db_err:
+        print(f"Gagal menghapus vektor dari database: {db_err}")
+    return {"status": "sukses", "pesan": f"{filename} dihapus!"}
 
 # ==========================================
 # AUTH: MODELS & ENDPOINTS
@@ -510,23 +551,42 @@ async def chat_ai(
         if match_isi and match_nama:
             isi_teks = match_isi.group(1).strip()
             nama_file_asli = match_nama.group(1).strip()
-            
             nama_unik = f"{uuid.uuid4().hex[:6]}_{nama_file_asli}"
-            os.makedirs("./dokumen_hasil", exist_ok=True)
-            lokasi_simpan = f"./dokumen_hasil/{nama_unik}"
-            
+            # Build bytes dulu, lalu persist ke storage/ disk
             if nama_file_asli.lower().endswith('.pdf'):
                 pdf = FPDF()
                 pdf.add_page()
                 pdf.set_font("Arial", size=11)
                 isi_teks_pdf = isi_teks.encode('latin-1', 'replace').decode('latin-1')
                 pdf.multi_cell(0, 7, txt=isi_teks_pdf)
-                pdf.output(lokasi_simpan)
+                # FPDF output as bytes
+                pdf_bytes = pdf.output(dest='S').encode('latin-1') if isinstance(pdf.output(dest='S'), str) else pdf.output(dest='S')
             else:
-                with open(lokasi_simpan, "w", encoding="utf-8") as f:
-                    f.write(isi_teks)
-            
-            link_download = f"http://localhost:8000/api/generated/download/{nama_unik}"
+                pdf_bytes = None
+            if _storage.is_enabled():
+                _, _, _, bucket_hasil = _storage._cfg()
+                if pdf_bytes is not None:
+                    _storage.upload_bytes(bucket_hasil, nama_unik, pdf_bytes, "application/pdf")
+                else:
+                    _storage.upload_bytes(bucket_hasil, nama_unik, isi_teks.encode("utf-8"), "text/plain; charset=utf-8")
+                # simpan juga ke /tmp agar konsisten (opsional)
+                lokasi_simpan = os.path.join(_tmp.gettempdir(), nama_unik)
+                if pdf_bytes is not None:
+                    with open(lokasi_simpan, "wb") as f:
+                        f.write(pdf_bytes)
+                else:
+                    with open(lokasi_simpan, "w", encoding="utf-8") as f:
+                        f.write(isi_teks)
+            else:
+                os.makedirs("./dokumen_hasil", exist_ok=True)
+                lokasi_simpan = f"./dokumen_hasil/{nama_unik}"
+                if pdf_bytes is not None:
+                    with open(lokasi_simpan, "wb") as f:
+                        f.write(pdf_bytes)
+                else:
+                    with open(lokasi_simpan, "w", encoding="utf-8") as f:
+                        f.write(isi_teks)
+            link_download = f"{BACKEND_PUBLIC_URL}/api/generated/download/{nama_unik}"
             jawaban_bersih = re.sub(r"<NAMA_FILE>.*?</NAMA_FILE>", "", jawaban)
             jawaban_bersih = re.sub(
                 r"<ISI_DOKUMEN>.*?</ISI_DOKUMEN>", 
@@ -598,6 +658,34 @@ def _resolve_file_path(filename: str, folder: str = "./kumpulan_dokumen") -> str
 # ==========================================
 @app.get("/api/files/download/{filename}")
 async def download_file(filename: str):
+    import urllib.parse
+    filename = urllib.parse.unquote(filename)
+    if _storage.is_enabled():
+        _, _, bucket_asli, _ = _storage._cfg()
+        # Coba exact dulu, fallback ke list untuk fuzzy jika tidak ketemu
+        try:
+            data = _storage.download_bytes(bucket_asli, filename)
+            tmp_path = os.path.join(_tmp.gettempdir(), os.path.basename(filename))
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            return FileResponse(tmp_path, filename=os.path.basename(filename))
+        except FileNotFoundError:
+            # fuzzy: cari yang match normalisasi
+            try:
+                candidates = _storage.list_objects(bucket_asli)
+                target = _normalisasi_nama(filename)
+                match = next((c for c in candidates if _normalisasi_nama(c) == target), None)
+                if not match:
+                    match = next((c for c in candidates if target in _normalisasi_nama(c) or _normalisasi_nama(c) in target), None)
+                if match:
+                    data = _storage.download_bytes(bucket_asli, match)
+                    tmp_path = os.path.join(_tmp.gettempdir(), os.path.basename(match))
+                    with open(tmp_path, "wb") as f:
+                        f.write(data)
+                    return FileResponse(tmp_path, filename=os.path.basename(match))
+            except Exception:
+                pass
+            raise HTTPException(status_code=404, detail="File tidak ditemukan.")
     file_path = _resolve_file_path(filename, "./kumpulan_dokumen")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File tidak ditemukan.")
@@ -607,6 +695,16 @@ async def download_file(filename: str):
 async def download_generated_file(filename: str):
     import urllib.parse
     filename = urllib.parse.unquote(filename)
+    if _storage.is_enabled():
+        _, _, _, bucket_hasil = _storage._cfg()
+        try:
+            data = _storage.download_bytes(bucket_hasil, filename)
+            tmp_path = os.path.join(_tmp.gettempdir(), os.path.basename(filename))
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            return FileResponse(tmp_path, filename=filename)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="File hasil tidak ditemukan.")
     file_path = os.path.join("./dokumen_hasil", filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File hasil tidak ditemukan.")
@@ -614,54 +712,89 @@ async def download_generated_file(filename: str):
 
 @app.get("/api/files/preview/{filename}")
 async def preview_file(filename: str):
-    file_path = _resolve_file_path(filename, "./kumpulan_dokumen")
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File tidak ditemukan.")
-        
+    import urllib.parse
+    filename = urllib.parse.unquote(filename)
+    # Ambil file ke /tmp jika dari Supabase
+    if _storage.is_enabled():
+        _, _, bucket_asli, _ = _storage._cfg()
+        try:
+            data = _storage.download_bytes(bucket_asli, filename)
+        except FileNotFoundError:
+            # fuzzy fallback
+            try:
+                candidates = _storage.list_objects(bucket_asli)
+                target = _normalisasi_nama(filename)
+                match = next((c for c in candidates if _normalisasi_nama(c) == target), None)
+                if not match:
+                    match = next((c for c in candidates if target in _normalisasi_nama(c) or _normalisasi_nama(c) in target), None)
+                if match:
+                    filename = match
+                    data = _storage.download_bytes(bucket_asli, match)
+                else:
+                    raise HTTPException(status_code=404, detail="File tidak ditemukan.")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=404, detail="File tidak ditemukan.")
+        file_path = os.path.join(_tmp.gettempdir(), os.path.basename(filename))
+        with open(file_path, "wb") as f:
+            f.write(data)
+    else:
+        file_path = _resolve_file_path(filename, "./kumpulan_dokumen")
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File tidak ditemukan.")
+
     nama_disk = os.path.basename(file_path)
     ekstensi = nama_disk.lower().split('.')[-1]
     if ekstensi == "pdf":
         return FileResponse(file_path)
-        
-    preview_dir = os.path.abspath("./kumpulan_dokumen/preview")
+    # COM hanya ada di Windows — di Render (Linux) kembalikan 501 yang jelas
+    if comtypes is None or pythoncom is None:
+        raise HTTPException(status_code=501, detail="Preview Office tidak tersedia di server Linux. Silakan download file.")
+    preview_dir = os.path.join(_tmp.gettempdir(), "preview")
     if not os.path.exists(preview_dir):
         os.makedirs(preview_dir)
-        
+
     pdf_filename = f"{nama_disk}.pdf"
     pdf_path = os.path.join(preview_dir, pdf_filename)
-    
+
     if os.path.exists(pdf_path):
         return FileResponse(pdf_path)
-        
+
     try:
         pythoncom.CoInitialize()
         if ekstensi in ["doc", "docx"]:
             word = comtypes.client.CreateObject("Word.Application")
             word.Visible = False
             doc = word.Documents.Open(file_path)
-            doc.SaveAs(pdf_path, FileFormat=17) 
+            doc.SaveAs(pdf_path, FileFormat=17)
             doc.Close()
             word.Quit()
         elif ekstensi in ["ppt", "pptx"]:
             powerpoint = comtypes.client.CreateObject("Powerpoint.Application")
             ppt = powerpoint.Presentations.Open(file_path, WithWindow=False)
-            ppt.SaveAs(pdf_path, 32) 
+            ppt.SaveAs(pdf_path, 32)
             ppt.Close()
             powerpoint.Quit()
         elif ekstensi in ["xls", "xlsx"]:
             excel = comtypes.client.CreateObject("Excel.Application")
             excel.Visible = False
             wb = excel.Workbooks.Open(file_path)
-            wb.ExportAsFixedFormat(0, pdf_path) 
+            wb.ExportAsFixedFormat(0, pdf_path)
             wb.Close(False)
             excel.Quit()
         else:
             raise HTTPException(status_code=400, detail="Format tidak didukung untuk preview.")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal convert ke PDF: {str(e)}")
     finally:
-        pythoncom.CoUninitialize()
-        
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
     if os.path.exists(pdf_path):
         return FileResponse(pdf_path)
     raise HTTPException(status_code=500, detail="File PDF tidak terbentuk.")
@@ -766,30 +899,48 @@ async def chat_ai_stream(
                     nama_file_asli = re.sub(r'[\\/*?:"<>|]', "", nama_file_asli)
                     
                     nama_unik = f"{uuid.uuid4().hex[:6]}_{nama_file_asli}"
-                    os.makedirs("./dokumen_hasil", exist_ok=True)
-                    lokasi_simpan = f"./dokumen_hasil/{nama_unik}"
-                    
-                    # PERBAIKAN: Jika PDF gagal dibuat, gunakan TXT dengan ekstensi TXT
+                    # Build bytes lalu persist ke Supabase jika aktif
+                    pdf_bytes = None
+                    txt_bytes = None
+                    is_pdf_req = nama_unik.lower().endswith(".pdf")
                     try:
-                        # Coba buat PDF
                         pdf = FPDF()
                         pdf.add_page()
                         pdf.set_font("Arial", size=11)
-                        # Sanitasi teks agar aman untuk FPDF (Latin-1)
                         isi_teks_pdf = isi_teks.encode('latin-1', 'ignore').decode('latin-1')
                         pdf.multi_cell(0, 7, txt=isi_teks_pdf)
-                        pdf.output(lokasi_simpan)
+                        out = pdf.output(dest='S')
+                        pdf_bytes = out.encode('latin-1') if isinstance(out, str) else bytes(out)
+                        if _storage.is_enabled():
+                            _, _, _, bucket_hasil = _storage._cfg()
+                            _storage.upload_bytes(bucket_hasil, nama_unik, pdf_bytes, "application/pdf")
+                        lokasi_simpan = os.path.join(_tmp.gettempdir(), nama_unik) if _storage.is_enabled() else f"./dokumen_hasil/{nama_unik}"
+                        if not _storage.is_enabled():
+                            os.makedirs("./dokumen_hasil", exist_ok=True)
+                        with open(lokasi_simpan, "wb") as f:
+                            f.write(pdf_bytes)
                         final_filename = nama_file_asli
                     except Exception as e:
-                        # Fallback ke TXT jika PDF gagal
                         print(f"Gagal membuat PDF, fallback ke TXT: {e}")
-                        txt_path = lokasi_simpan.replace(".pdf", ".txt")
-                        with open(txt_path, "w", encoding="utf-8") as f:
-                            f.write(isi_teks)
-                        lokasi_simpan = txt_path
-                        final_filename = nama_file_asli.replace(".pdf", ".txt")
+                        txt_bytes = isi_teks.encode("utf-8")
+                        nama_txt = nama_unik.replace(".pdf", ".txt") if is_pdf_req else nama_unik
+                        if _storage.is_enabled():
+                            _, _, _, bucket_hasil = _storage._cfg()
+                            try:
+                                _storage.upload_bytes(bucket_hasil, nama_txt, txt_bytes, "text/plain; charset=utf-8")
+                            except Exception as se:
+                                print(f"[storage] upload hasil txt gagal: {se}")
+                            lokasi_simpan = os.path.join(_tmp.gettempdir(), nama_txt)
+                            with open(lokasi_simpan, "wb") as f:
+                                f.write(txt_bytes)
+                        else:
+                            os.makedirs("./dokumen_hasil", exist_ok=True)
+                            lokasi_simpan = f"./dokumen_hasil/{nama_txt}"
+                            with open(lokasi_simpan, "w", encoding="utf-8") as f:
+                                f.write(isi_teks)
+                        final_filename = nama_file_asli.replace(".pdf", ".txt") if is_pdf_req else nama_file_asli
                         
-                    link_download = f"http://localhost:8000/api/generated/download/{os.path.basename(lokasi_simpan)}"
+                    link_download = f"{BACKEND_PUBLIC_URL}/api/generated/download/{os.path.basename(lokasi_simpan)}"
                     pesan_selesai = f"\n\n✨ **Selesai!** 📥 [**Unduh {final_filename} di sini**]({link_download})"
                     yield f"data: {json.dumps({'token': pesan_selesai})}\n\n"
                 else:
