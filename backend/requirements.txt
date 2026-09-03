@@ -9,13 +9,11 @@ python-multipart
 langchain
 langchain-core
 langchain-google-genai
-langchain-huggingface
 langchain-postgres
 langchain-text-splitters
 psycopg[binary]
 sqlalchemy
 pgvector
-sentence-transformers
 pypdf
 fpdf2
 python-docx

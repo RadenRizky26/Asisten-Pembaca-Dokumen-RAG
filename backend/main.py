@@ -33,8 +33,48 @@ def bersihkan_teks(teks: str) -> str:
 
 # Pustaka AI LangChain
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
+import httpx
 from langchain_postgres import PGVector
+
+# ponytail: local sentence-transformers (torch ~2GB) dihapus untuk Render Free.
+# Ganti dengan HF Inference API gratis — no torch, httpx sudah ada.
+# Upgrade path: HF_TOKEN kosong -> error jelas; set HF_TOKEN di Render.
+class HuggingFaceInferenceEmbeddings(Embeddings):
+    def __init__(self, model: str | None = None, api_key: str | None = None):
+        self.model = model or os.getenv("HF_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+        self.api_key = api_key or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or ""
+        self.url = f"https://router.huggingface.co/hf-inference/models/{self.model}"
+
+    def _headers(self):
+        h = {"Content-Type": "application/json"}
+        if self.api_key:
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        # HF feature-extraction: POST {"inputs": [...], "options": {"wait_for_model": true}}
+        with httpx.Client(timeout=30) as c:
+            r = c.post(self.url, json={"inputs": texts, "options": {"wait_for_model": True}}, headers=self._headers())
+        if r.status_code == 401:
+            raise RuntimeError("HF Inference 401 — set HF_TOKEN (https://huggingface.co/settings/tokens) di .env / Render Env")
+        if r.status_code != 200:
+            raise RuntimeError(f"HF Inference {r.status_code}: {r.text[:400]}")
+        data = r.json()
+        # HF returns [[float]] for single string, [[[float]]] for batch — normalisasi ke list[list[float]]
+        if isinstance(data, list) and data and isinstance(data[0], (int, float)):
+            return [data]  # single vector -> wrap
+        return data  # type: ignore
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        # batch 32 biar tidak kena rate limit gratis
+        out: list[list[float]] = []
+        for i in range(0, len(texts), 32):
+            out.extend(self._embed(texts[i:i+32]))
+        return out
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed([text])[0]
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -73,7 +113,7 @@ async def ping():
 
 def get_vector_db():
     if not hasattr(get_vector_db, "_instance"):
-        embeddings = HuggingFaceEmbeddings(model_name="paraphrase-multilingual-MiniLM-L12-v2")
+        embeddings = HuggingFaceInferenceEmbeddings()
         get_vector_db._instance = PGVector(
             embeddings=embeddings,
             collection_name="dokumen_rag",
@@ -234,9 +274,16 @@ async def upload_dokumen(
         raise HTTPException(status_code=500, detail=f"Gagal menyimpan file: {str(e)}")
 
     UPLOAD_STATUS[filename] = {"status": "proses", "detail": f"{filename} sedang diindeks..."}
-    background_tasks.add_task(_proses_dokumen, file_path, filename, user_id, x_session_id)
-
-    return {"status": "proses", "pesan": f"{filename} sedang diproses di background."}
+    # ponytail: Vercel serverless kills BackgroundTasks after response. Run inline for deploy.
+    # Local dev can flip USE_BACKGROUND=1 to re-enable BackgroundTasks.
+    if os.getenv("USE_BACKGROUND") == "1" and background_tasks is not None:
+        background_tasks.add_task(_proses_dokumen, file_path, filename, user_id, x_session_id)
+        return {"status": "proses", "pesan": f"{filename} sedang diproses di background."}
+    _proses_dokumen(file_path, filename, user_id, x_session_id)
+    result = UPLOAD_STATUS.get(filename, {"status": "sukses", "detail": "Selesai"})
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["detail"])
+    return {"status": "sukses", "pesan": f"{filename} berhasil diproses."}
 
 @app.get("/api/upload/status/{filename}")
 async def upload_status(filename: str):
