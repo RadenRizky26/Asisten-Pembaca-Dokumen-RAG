@@ -613,17 +613,12 @@ logging.basicConfig(
 
 
 def re_rank(query: str, documents: List[Document], k: int = 3) -> List[Document]:
+    # ponytail: reranker (CrossEncoder) removed for deploy — heavy model + cold start on Render Free.
+    # Upgrade path: re-add sentence-transformers CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+    # and call reranker.predict(pairs) when persistent disk / paid tier available.
     if not documents:
         return []
-    
-    pairs = [(query, doc.page_content) for doc in documents]
-    scores = reranker.predict(pairs)
-    
-    # Urutkan berdasarkan skor re-ranker
-    scored_docs = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
-    return [doc for score, doc in scored_docs[:k]]
-
-    return re.sub(r"[^a-z0-9]+", " ", nama.lower()).strip()
+    return documents[:k]
 
 def _normalisasi_nama(nama: str) -> str:
     import re
