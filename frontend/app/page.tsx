@@ -71,7 +71,7 @@ export default function Home() {
     pesanAkhirRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chat, streamingText]);
 
-  const API = "http://localhost:8000";
+  const API = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
   const authHeaders = useCallback((): Record<string, string> => {
     const headers: Record<string, string> = {};
@@ -341,8 +341,9 @@ export default function Home() {
             }
           }
           reject("Proses indeks terlalu lama. Coba lagi atau gunakan file yang lebih kecil.");
-        } catch {
-          reject("Gagal mengupload dokumen. Pastikan backend berjalan.");
+        } catch (e: any) {
+          console.error("[upload] fetch error", e);
+          reject(String(e?.message || e) + " - Pastikan backend berjalan di " + API);
         }
       };
       doUpload();

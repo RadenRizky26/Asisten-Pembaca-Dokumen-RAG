@@ -1,3 +1,17 @@
 .playwright-mcp/
-
 docs/
+
+# Env files - JANGAN commit ini
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+api/__pycache__/
+
+# Node
+frontend/node_modules/
+frontend/.next/

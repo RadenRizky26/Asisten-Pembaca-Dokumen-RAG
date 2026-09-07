@@ -3,10 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import Depends, HTTPException, Header
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
-from jwt.exceptions import PyJWTError as JWTError
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -18,7 +15,6 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-security = HTTPBearer(auto_error=False)
 
 
 class UserPublic(BaseModel):
@@ -44,25 +40,6 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 def decode_token(token: str) -> Optional[dict]:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except Exception:
         return None
-
-
-async def get_optional_user(
-    authorization: Optional[HTTPAuthorizationCredentials] = Depends(security),
-) -> Optional[dict]:
-    if authorization is None:
-        return None
-    payload = decode_token(authorization.credentials)
-    return payload
-
-
-async def get_current_user(
-    authorization: HTTPAuthorizationCredentials = Depends(security),
-) -> dict:
-    payload = decode_token(authorization.credentials)
-    if payload is None:
-        raise HTTPException(status_code=401, detail="Token tidak valid")
-    return payload

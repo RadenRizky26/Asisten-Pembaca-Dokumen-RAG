@@ -1,4 +1,4 @@
-const API = "http://localhost:8000";
+const API = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
 export async function apiRegister(
   email: string,
