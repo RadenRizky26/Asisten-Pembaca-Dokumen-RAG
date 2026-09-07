@@ -71,7 +71,7 @@ export default function Home() {
     pesanAkhirRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chat, streamingText]);
 
-  const API = "http://localhost:8000";
+  const API = process.env.NEXT_PUBLIC_BACKEND_URL;
 
   const authHeaders = useCallback((): Record<string, string> => {
     const headers: Record<string, string> = {};

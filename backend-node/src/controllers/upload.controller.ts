@@ -111,7 +111,7 @@ export const uploadFile = async (req: Request, res: Response) => {
 };
 
 export const getUploadStatus = async (req: Request, res: Response) => {
-  const { filename } = req.params;
+  const filename = req.params.filename as string;
   const status = uploadStatus.get(filename);
   if (!status) return resHelper.notFound(res, 'Status tidak ditemukan.');
   resHelper.ok(res, status);
@@ -122,7 +122,7 @@ async function parsePdfBuffer(buffer: Buffer, filename: string, metadata: any) {
   const pdfParse = (await import('pdf-parse')).default;
   const data = await pdfParse(buffer);
   const pages = data.text.split(/\f/);
-  return pages.map((text, i) => ({
+  return pages.map((text: string, i: number) => ({
     pageContent: `--- Halaman ${i+1} ---\n${text}`,
     metadata: { ...metadata, source: filename, page: i+1 }
   }));
@@ -152,8 +152,8 @@ async function parsePptxBuffer(buffer: Buffer, filename: string, metadata: any) 
 async function parseXlsxBuffer(buffer: Buffer, filename: string, metadata: any) {
   const ExcelJS = (await import('exceljs')).default;
   const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.load(buffer);
-  const docs = [];
+  await workbook.xlsx.load(buffer as any);
+  const docs: any[] = [];
   workbook.eachSheet((worksheet) => {
     let text = `--- Sheet ${worksheet.name} ---\n`;
     worksheet.eachRow((row) => {

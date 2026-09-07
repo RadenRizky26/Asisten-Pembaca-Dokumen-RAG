@@ -62,8 +62,8 @@ export function MessageContent({
   }
 
   // Sembunyikan tag XML pembuatan dokumen dari chat (karena di-handle backend)
-  processedText = processedText.replace(/<NAMA_FILE>.*?<\/NAMA_FILE>/gs, "");
-  processedText = processedText.replace(/<ISI_DOKUMEN>.*?<\/ISI_DOKUMEN>/gs, "");
+  processedText = processedText.replace(/<NAMA_FILE>[\s\S]*?<\/NAMA_FILE>/g, "");
+  processedText = processedText.replace(/<ISI_DOKUMEN>[\s\S]*?<\/ISI_DOKUMEN>/g, "");
 
   return (
     <div

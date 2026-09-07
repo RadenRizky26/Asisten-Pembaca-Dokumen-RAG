@@ -19,7 +19,7 @@ export default function PDFPreview({ filename, pageNumber, onClose }: PDFPreview
 
   // Semua format Office sekarang didukung via endpoint /preview/
   const isOfficeOrPdf = /\.(pdf|doc|docx|ppt|pptx|xls|xlsx)$/i.test(filename);
-  const downloadUrl = `http://localhost:8000/api/files/download/${filename}`;
+  const downloadUrl = `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/files/download/${filename}`;
 
   useEffect(() => {
     if (!isOfficeOrPdf) return; 
@@ -144,7 +144,7 @@ export default function PDFPreview({ filename, pageNumber, onClose }: PDFPreview
       <div className="flex-1 overflow-auto bg-[var(--color-canvas-soft)] relative p-4">
         <div className="w-fit mx-auto">
           <PDFComponent.Document 
-            file={`http://localhost:8000/api/files/preview/${filename}`}
+            file={`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/files/preview/${filename}`}
             onLoadSuccess={onDocumentLoadSuccess}
 
             onLoadError={(error: Error) => console.error("Error loading PDF Document:", error)}
